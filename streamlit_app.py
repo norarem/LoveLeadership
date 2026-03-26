@@ -1426,4 +1426,3 @@ else:
     # fallback (in case something weird happens)
     st.session_state.page = "consent"
     st.rerun()
-=======
