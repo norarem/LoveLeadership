@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 import streamlit as st
 import random
 import uuid
@@ -1428,5 +1427,3 @@ else:
     st.session_state.page = "consent"
     st.rerun()
 =======
-
->>>>>>> 93071376ba90fd20b632f78c235ac03ae20b6f6d
