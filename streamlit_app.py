@@ -59,7 +59,7 @@ from navigation_helpers import (
 )
 
 st.set_page_config(
-    page_title="Love in Leadership",
+    page_title="Leadership styles",
     layout="centered",
     initial_sidebar_state="expanded"
 )
@@ -296,7 +296,7 @@ leadership, prime = st.session_state.condition
 # Pages
 # ----------------------------
 def page_consent():
-    st.title("Love in Leadership — Study")
+    st.title("Leadership — Study")
 
     st.write("""
  Dear respondent, 
