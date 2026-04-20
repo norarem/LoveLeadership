@@ -1,6 +1,7 @@
 LEADERSHIP_STYLES = ["servant", "task_focused", "authoritarian"]
 PRIMES = ["love", "neutral"]
-PILOT_MODE = True
+PILOT_MODE = False
+EXPERIMENT_VERSION = "2026-04-17-launch1"
 
 NASA_ITEMS = [
     "Box of matches",
@@ -38,11 +39,31 @@ NASA_EXPERT_RANK = {
     "Solar-powered FM receiver-transmitter": 5,
 }
 
+NASA_REASONING_SHORT = {
+    "Two 100-lb tanks of oxygen": "breathable oxygen is the first survival need",
+    "5 gallons of water": "water is essential for preventing dehydration during the journey",
+    "Stellar map (of the moon's constellations)": "navigation on the moon matters more than many people first expect",
+    "Food concentrate": "food gives energy, but it is less urgent than oxygen, water, and navigation",
+    "Solar-powered FM receiver-transmitter": "communication can support rescue and coordination, especially because it is solar-powered",
+    "50 feet of nylon rope": "it helps with climbing, moving equipment, and supporting injured people",
+    "Parachute silk": "it can be used for protection and for carrying or covering materials",
+    "Portable heating unit": "heating is less useful here than people first assume under moon conditions",
+    "Two .45 caliber pistols": "they have limited practical survival value in this scenario",
+    "One case of dehydrated milk": "it requires water, and water is too valuable to spend on milk",
+    "Self-inflating life raft": "it can help carry equipment or people across the surface",
+    "Magnetic compass": "magnetic navigation does not work here the way it does on Earth",
+    "Signal flares": "they are less useful than the stronger survival and navigation items",
+    "First aid kit (including injection needle)": "treating injuries helps the team stay physically capable",
+    "Box of matches": "matches are useless without an oxygen-rich atmosphere",
+}
+
+
 LEADER_OPENING = {
     "servant": (
-        "Hi everyone. I’m glad we can do this together. "
-        "I really want to hear what each of you thinks, because every perspective can help. "
-        "Let’s support each other and work step by step toward a good decision as a team."
+        "Hi everyone. I’m really glad we can do this together. "
+        "My role here is to support the team and make sure everyone has room to contribute comfortably. "
+        "If something feels unclear, we can slow down and work through it together. "
+        "Let’s listen carefully, help one another, and build a thoughtful ranking step by step."
     ),
     "task_focused": (
         "Hello team. Let’s work through this in a clear and efficient way. "
@@ -56,13 +77,14 @@ LEADER_OPENING = {
     )
 }
 
+
 LEADER_HINTS = {
     "servant": [
-        "Thank you for your ideas so far. Let’s make sure everyone gets space to contribute.",
-        "You’re all raising useful points. Let’s think together about which items truly help us survive first.",
-        "I’d like us to build this step by step, starting with the essentials like oxygen and water.",
-        "Let’s check whether everyone feels comfortable with the direction of the ranking so far.",
-        "We’re doing well. Let’s keep listening to each other and move toward a decision we can all support."
+        "Thank you all — I want to make sure everyone feels heard before we lock anything in.",
+        "If anyone feels unsure, please say so. We can slow down and make the reasoning clearer together.",
+        "I appreciate how people are helping each other think. Let’s keep the discussion supportive as well as useful.",
+        "We’re making progress, and I want to make sure no one gets rushed past their point or left out of the decision.",
+        "Before we move on, let’s check whether anyone still wants to add a thought or concern.",
     ],
     "task_focused": [
         "Let’s keep the discussion structured and focus on survival utility.",
@@ -79,6 +101,8 @@ LEADER_HINTS = {
         "Give me a clear answer so we can move forward."
     ]
 }
+
+
 
 ITEM_ALIASES = {
     "Box of matches": ["matches", "match", "lucifers", "aansteker", "lighter"],

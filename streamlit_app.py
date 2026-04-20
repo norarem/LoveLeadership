@@ -29,8 +29,6 @@ from ranking_helpers import (
     format_slot_memory,
     format_group_rank_memory,
     get_ui_ranking_summary,
-    get_next_empty_ui_slots,
-    next_unresolved_slots,
     detect_ui_rank_changes,
     store_ui_rank_changes,
     store_pending_ui_rank_changes,
@@ -45,7 +43,19 @@ from chat_logic import (
     ui_rank_change_reaction,
     detect_bad_teammate_claim,
     leader_reply_to_teammate,
+    should_trigger_team_micro_conflict,
+    build_team_micro_conflict,
     choose_speaking_flow,
+    extract_named_teammates_from_text,
+    recent_role_messages,
+    get_next_slot_text,
+    is_david_hurry_message,
+)
+
+from navigation_helpers import (
+    init_navigation_state,
+    set_survey_stage,
+    hide_streamlit_page_nav,
 )
 
 st.set_page_config(
@@ -53,6 +63,8 @@ st.set_page_config(
     layout="centered",
     initial_sidebar_state="expanded"
 )
+
+hide_streamlit_page_nav()
 
 
 # ----------------------------
@@ -100,6 +112,7 @@ def reset_discussion_state(preserve_chat=False):
     st.session_state.last_speaking_flow = None
     st.session_state.last_user_chat_time = 0.0
 
+
     st.session_state.teammate_memory = {
         "Anna": {"likes": set(), "dislikes": set()},
         "Bas": {"likes": set(), "dislikes": set()},
@@ -123,6 +136,9 @@ def reset_discussion_state(preserve_chat=False):
     st.session_state.pending_ui_rank_changes = []
     st.session_state.last_ui_reaction_turn = -999
     st.session_state.last_ui_reaction_time = 0.0
+    st.session_state.david_hurry_count = 0
+    st.session_state.team_micro_conflict_used = False
+    st.session_state.last_micro_conflict_turn = -999
 
 
 def init_discussion_state():
@@ -174,6 +190,12 @@ def init_discussion_state():
         st.session_state.last_speaking_flow = None
     if "last_user_chat_time" not in st.session_state:
         st.session_state.last_user_chat_time = 0.0
+    if "david_hurry_count" not in st.session_state:
+        st.session_state.david_hurry_count = 0
+    if "team_micro_conflict_used" not in st.session_state:
+        st.session_state.team_micro_conflict_used = False
+    if "last_micro_conflict_turn" not in st.session_state:
+        st.session_state.last_micro_conflict_turn = -999
 
 
 def clear_discussion():
@@ -185,27 +207,6 @@ def clear_discussion():
 
 def add_msg(role, text):
     st.session_state.chat.append({"role": role, "text": text})
-
-
-def recent_role_messages(role, n=8):
-    msgs = []
-    for msg in reversed(st.session_state.get("chat", [])):
-        if msg.get("role") == role:
-            msgs.append(msg.get("text", ""))
-        if len(msgs) >= n:
-            break
-    return msgs
-
-
-def get_next_slot_text(limit=3):
-    next_slots = get_next_empty_ui_slots(limit=limit)
-    if not next_slots:
-        next_slots = next_unresolved_slots(limit=limit)
-
-    if not next_slots:
-        return "the next unresolved slots"
-
-    return ", ".join([f"#{x}" for x in next_slots])
 
 
 def get_typing_delay_for_role(role):
@@ -261,6 +262,8 @@ def process_pending_bot_messages():
 
 
 def init_session():
+    init_navigation_state()
+ 
     if "participant_id" not in st.session_state:
         st.session_state.participant_id = str(uuid.uuid4())
 
@@ -298,11 +301,11 @@ def page_consent():
     st.write("""
  Dear respondent, 
              
-Thank you in advance for filling in this survey, and therefore participating in this research conducted by a master student at Erasmus University Rotterdam. This research aims to investigate the relationship between love in leadership and team performance and experience. 
+Thank you in advance for filling in this survey, and therefore participating in this research conducted by a master student at Erasmus University Rotterdam. This research aims to investigate the relationship between leadership and team performance.
 
-First, some general information is needed, afterwards you will complete a short writing tasks and a group decision-making task. You will be matched with a team including a leader and other team members. Lastly, a short survey is presented in which you can talk about your experience of the experiment. Your participation in this research is highly valued. 
+First, some general information is needed, afterwards you will complete a short writing tasks and a group decision-making task. Lastly, a short survey is presented in which you can talk about your experience of the experiment. Your participation in this research is highly valued. 
              
-The entire experiment will take about 15 to 20 minutes, and the data will be used for research purposes only. The experiment is done anonymously. The responses will be kept confidential and will not be shared with any third parties. Moreover, there are no right or wrong answers, and you are free to stop the experiment at any moment.  
+The entire experiment will take about 15 to 20 minutes, and the data will be used for research purposes only. The experiment is done anonymously. The responses will be kept confidential and will not be shared with any third parties. Moreover, the main language for the experiment is English, there are no right or wrong answers, and you are free to stop the experiment at any moment.  
 
 For further information or questions, feel free to send an email to Nora Remijnse at 569443gr@eur.nl. 
  
@@ -316,10 +319,10 @@ Please select the “I consent to participate in this study” box below if you:
     st.subheader("Consent")
     consent = st.checkbox("I consent to participate in this study.")
 
-    st.subheader("Demographics (optional)")
+    st.subheader("Demographics")
 
     age_category = st.selectbox(
-        "Age",
+        "What is your age?",
         [
             "18–24",
             "25–34",
@@ -327,24 +330,54 @@ Please select the “I consent to participate in this study” box below if you:
             "45–54",
             "55–64",
             "65+",
+            "Prefer not to say",
         ],
+        index=None,
+        placeholder="Select an option",
     )
 
     gender = st.selectbox(
-        "Gender",
+        "What is your gender?",
         [
             "Male",
             "Female",
             "Non-binary",
             "Prefer not to say",
         ],
+        index=None,
+        placeholder="Select an option",
     )
 
-    country = st.text_input("Which country are you from?")
+    education_level = st.selectbox(
+        "What is your highest completed level of education?",
+        [
+            "Primary or middle secondary education (Dutch: primary school / VMBO)",
+            "Upper secondary or practice-oriented education (Dutch: HAVO / VWO / MBO)",
+            "Higher professional or undergraduate university education (Dutch: HBO bachelor/master / WO bachelor)",
+            "Graduate university education (Dutch: WO master / PhD)",
+            "Prefer not to say",
+        ],
+        index=None,
+        placeholder="Select an option",
+    )
+
+    country = st.text_input("What is your nationality?")
 
     if st.button("Next"):
         if not consent:
             st.error("Please provide consent to continue.")
+            return
+
+        if age_category is None:
+            st.error("Please select your age before continuing.")
+            return
+
+        if gender is None:
+            st.error("Please select your gender before continuing.")
+            return
+
+        if education_level is None:
+            st.error("Please select your highest completed level of education before continuing.")
             return
 
         if not country.strip():
@@ -356,9 +389,11 @@ Please select the “I consent to participate in this study” box below if you:
         st.session_state.data["consent"] = True
         st.session_state.data["age_category"] = age_category
         st.session_state.data["gender"] = gender
+        st.session_state.data["education_level"] = education_level
         st.session_state.data["country"] = country.strip()
 
         st.session_state.page = "priming"
+        set_survey_stage("priming")
         st.rerun()
 
 
@@ -366,11 +401,12 @@ def page_priming():
     st.title("Writing task")
 
     if prime == "love":
-        prompt = "Please write about a past experience in which you felt loved."
+        prompt = "Please write about a situation in which you would feel cared for / loved."
     else:
         prompt = "Please write directions to the supermarket nearest to your home."
 
     st.write(prompt)
+    st.caption("You may write this part in either English or Dutch")
     text = st.text_area("Your response", height=200)
 
     st.caption("Minimum 100 characters to continue.")
@@ -379,6 +415,7 @@ def page_priming():
     with col1:
         if st.button("Back"):
             st.session_state.page = "consent"
+            set_survey_stage("consent")
             st.rerun()
 
     with col2:
@@ -388,6 +425,7 @@ def page_priming():
                 return
             st.session_state.data["priming_text"] = text.strip()
             st.session_state.page = "task"
+            set_survey_stage("task")
             st.rerun()
 
 
@@ -432,58 +470,67 @@ def render_task_sidebar():
 def render_task_instructions():
     with st.expander("Instructions", expanded=True):
         st.write("""
-You are now starting the experiment. Please take your time and make sure you are sitting somewhere quiet where you won’t be distracted. You may use a pencil and paper to write out some notes for yourself.
+You are now starting the experiment.
 
-Try to stay focused throughout the task, but most of all...:
+Please take your time and make sure you are in a quiet place where you will not be distracted. You may use pencil and paper to make notes if you want.
+
+Try to stay focused during the task.
 
 Good luck, and have fun! 🚀
-                 
----              
+
+---
 
 **Scenario 🌕**
 
-Imagine this:
+Imagine the following situation:
 
-Your spaceship has crashed on the moon.  
-You are safe, but far away from help.
+Your spaceship has crash-landed on the sunlit side of the moon.
+The ship is damaged, so you cannot use it for transport or communication.
+You do not have contact with rescue.
+Base your decisions only on the 15 items shown below.
 
-You have **15 items** with you.  
-Your goal is to figure out which items are the **most important to stay alive** until rescue arrives 🚀
+Your goal is to decide which items are **most important for survival** until help arrives.
 
 ---
 
 **Step 1 – Team discussion 🗣️**
 
-You are working together with a team, including 1 leader, 5 other members, and you.
+You are working together with a team that includes:
+- 1 leader
+- 5 other team members
+- you
 
-Use the chat to talk about the items:
+Use the chat to discuss the items.
 
-- Say what you think is important  
-- React to what others say  
-- Try to agree on the best items together  
+You can:
+- say which items you think are important
+- react to what others say
+- work together with the team to decide on the ranking
 
-Please send **at least 2 messages** before continuing.💬   
+Please send **at least 2 chat messages** before the ranking section opens. 💬
 
 ---
 
 **Step 2 – Final ranking 🔢**
 
-After the discussion, rank all 15 items.
+After the discussion, **you** submit the final ranking yourself.
 
-- Give each item a number
-- **1 = most important**  
+- Rank all 15 items
+- **1 = most important**
 - **15 = least important**
+- You can use each number only **once**
 
-You can only use each number **once**
+**You may already start filling in the ranking during the discussion. The team members may comment on your choices.**
 
 ---
 
 **Step 3 – Submit your answers ✅**
 
-When you are done: 
-- Check your ranking carefully. 
-- Make sure every number is used once
-                  
+When you are done:
+
+- check your ranking carefully
+- make sure each number is used once
+
 Then click **Submit ranking** to continue.
 """)
 
@@ -520,6 +567,8 @@ def page_task():
 
     render_task_sidebar()
     render_task_instructions()
+
+    st.caption("After at least 2 chat messages, the ranking section unlocks. You submit the final top 15, made together with your team.")
 
     # --- Layout: chat left, items right ---
     left, right = st.columns([2, 1], gap="large")
@@ -612,20 +661,24 @@ def page_task():
                 and parse_message_features(msg.get("text", "")).get("slot_request") is not None
             )
 
+            slot_prompt_starters = (
+                "what should be number",
+                "what should number",
+                "what is number",
+                "what about number",
+                "and number",
+                "what is #",
+                "what is ",
+                "and ",
+            )
+
+            user_is_only_asking_for_slot = explicit_slot is not None and not mentioned
+
             is_lazy_ranking = (
-                explicit_slot is not None
+                user_is_only_asking_for_slot
                 and (
                     repeated_slot_asking >= 2
-                    or normalized_user_text.startswith((
-                        "what should be number",
-                        "what should number",
-                        "what is number",
-                        "what about number",
-                        "and number",
-                        "what is #",
-                        "what is ",
-                        "and ",
-                    ))
+                    or normalized_user_text.startswith(slot_prompt_starters)
                 )
                 and st.session_state.turns >= 3
             )
@@ -653,6 +706,7 @@ def page_task():
             step = st.session_state.teammate_step
             last_bot = st.session_state.last_bot_msg
             all_teammates = ["Anna", "Bas", "Carlos", "David", "Emily"]
+            addressed_teammates = extract_named_teammates_from_text(text)
 
             short_simple_input = (
                 len(text.strip()) < 24 and
@@ -660,6 +714,8 @@ def page_task():
                 question_type in ["item_check", "confirmation", "none"] and
                 meta_intent == "none"
             )
+
+            reasoning_themes = features["reasoning_themes"]
 
             def recent_teammates_used(n=6):
                 recent = []
@@ -706,10 +762,25 @@ def page_task():
 
                 return chosen
 
-            def choose_teammates(user_text, mentioned, label, question_type, meta_intent, explicit_slot, asking_direct_item, short_simple_input, is_lazy_ranking):
+            def choose_teammates(
+                user_text,
+                mentioned,
+                label,
+                question_type,
+                meta_intent,
+                explicit_slot,
+                asking_direct_item,
+                short_simple_input,
+                is_lazy_ranking,
+                addressed_teammates,
+                reasoning_themes,
+            ):
                 wrong_or_weak_local = is_wrong_or_weak_message(user_text, mentioned, label)
+                named_targets = [tm for tm in addressed_teammates if tm in all_teammates]
 
-                if meta_intent in ["confused", "next_step", "boundary_check"]:
+                if named_targets:
+                    num_teammates = 1
+                elif meta_intent in ["confused", "next_step", "boundary_check", "scenario_question"]:
                     num_teammates = random.choice([2, 2, 3])
                 elif explicit_slot is not None:
                     num_teammates = random.choice([2, 2, 3])
@@ -724,9 +795,23 @@ def page_task():
                 else:
                     num_teammates = random.choice([2, 3])
 
-                candidate_sets = []
-
-                if meta_intent == "confused":
+                if named_targets:
+                    primary = named_targets[0]
+                    target_sets = {
+                        "Anna": [["Anna", "Emily"], ["Anna", "David"], ["Anna", "Carlos"]],
+                        "Bas": [["Bas", "Emily"], ["Bas", "Carlos"], ["Bas", "Anna"]],
+                        "Carlos": [["Carlos", "Anna"], ["Carlos", "Emily"], ["Carlos", "David"]],
+                        "David": [["David", "Emily"], ["David", "Anna"], ["David", "Carlos"]],
+                        "Emily": [["Emily", "Anna"], ["Emily", "David"], ["Emily", "Carlos"]],
+                    }
+                    candidate_sets = target_sets.get(primary, [["Anna", "Emily"]])
+                elif reasoning_themes:
+                    candidate_sets = [
+                        ["Emily", "Anna"],
+                        ["Emily", "Carlos"],
+                        ["Anna", "Bas"],
+                    ]
+                elif meta_intent == "confused":
                     candidate_sets = [
                         ["Anna", "Emily"],
                         ["David", "Emily"],
@@ -742,6 +827,12 @@ def page_task():
                     candidate_sets = [
                         ["Emily", "Anna"],
                         ["David", "Emily"],
+                    ]
+                elif meta_intent == "scenario_question":
+                    candidate_sets = [
+                        ["Emily", "Anna"],
+                        ["Emily", "David"],
+                        ["Anna", "Carlos"],
                     ]
                 elif explicit_slot is not None:
                     candidate_sets = [
@@ -789,6 +880,27 @@ def page_task():
 
                 selected = random.choice(candidate_sets)
 
+                if named_targets:
+                    primary = named_targets[0]
+                    return [primary]
+
+                david_hurry_count = st.session_state.get("david_hurry_count", 0)
+
+                if (
+                    not st.session_state.get("team_micro_conflict_used", False)
+                    and meta_intent == "none"
+                    and "David" not in selected
+                    and (
+                        1 <= st.session_state.turns <= 4
+                        or (david_hurry_count == 1 and st.session_state.turns <= 8)
+                    )
+                ):
+                    if num_teammates <= 1:
+                        selected = ["David"]
+                    else:
+                        selected = ["David"] + [tm for tm in selected if tm != "David"]
+                        selected = selected[:num_teammates]
+
                 if num_teammates == 3:
                     remaining = [tm for tm in all_teammates if tm not in selected]
                     remaining = choose_distinct(remaining, len(remaining))
@@ -796,8 +908,13 @@ def page_task():
                         selected.append(remaining[0])
 
                 selected = choose_distinct(selected, num_teammates)
-                return selected
-        
+
+                for tm in reversed(named_targets):
+                    if tm in selected:
+                        selected.remove(tm)
+                        selected.insert(0, tm)
+
+                return selected[:num_teammates]        
 
             selected_teammates = choose_teammates(
                 user_text=text,
@@ -808,8 +925,11 @@ def page_task():
                 explicit_slot=explicit_slot,
                 asking_direct_item=asking_direct_item,
                 short_simple_input=short_simple_input,
-                is_lazy_ranking=is_lazy_ranking
+                is_lazy_ranking=is_lazy_ranking,
+                addressed_teammates=addressed_teammates,
+                reasoning_themes=reasoning_themes,
             )
+
 
             if is_lazy_ranking:
                 selected_teammates = []
@@ -820,8 +940,12 @@ def page_task():
                     meta_intent=meta_intent,
                     explicit_slot=explicit_slot,
                     asking_direct_item=asking_direct_item,
-                    wrong_or_weak=wrong_or_weak
+                    wrong_or_weak=wrong_or_weak,
+                    question_type=question_type,
                 )
+
+                if addressed_teammates and selected_teammates:
+                    speaking_flow = "teammate_first"
 
             queue_plan = []
 
@@ -863,6 +987,7 @@ def page_task():
             last_generated_text = None
             for idx, entry in enumerate(queue_plan):
                 role_name, prepared_text, reply_to_role, reply_to_text = entry
+                effective_reply_text = reply_to_text or ""
 
                 if role_name == "Leader":
                     if prepared_text is not None:
@@ -875,29 +1000,61 @@ def page_task():
                             final_text = leader_text
 
                 else:
-                    if reply_to_role == "You":
-                        source_text = text
-                    elif reply_to_role and reply_to_role == last_generated_role and last_generated_text:
-                        source_text = last_generated_text
+                    if prepared_text is not None:
+                        final_text = prepared_text
                     else:
-                        source_text = generated_texts.get(reply_to_role, reply_to_text or "")
-                    final_text = teammate_reply_persona(
-                        teammate_name=role_name,
-                        user_text=text,
-                        leader_text=leader_text,
-                        label=label,
-                        proposed_items=mentioned,
-                        last_bot_msg=last_bot,
-                        step=step + idx,
-                        reply_to_role=reply_to_role,
-                        reply_to_text=source_text
-                    )
+                        if reply_to_role == "You":
+                            source_text = text
+                        elif reply_to_role and reply_to_role == last_generated_role and last_generated_text:
+                            source_text = last_generated_text
+                        else:
+                            source_text = generated_texts.get(reply_to_role, reply_to_text or "")
+
+                        effective_reply_text = source_text
+
+                        final_text = teammate_reply_persona(
+                            teammate_name=role_name,
+                            user_text=text,
+                            leader_text=leader_text,
+                            label=label,
+                            proposed_items=mentioned,
+                            last_bot_msg=last_bot,
+                            step=step + idx,
+                            reply_to_role=reply_to_role,
+                            reply_to_text=source_text
+                        )
 
                 st.session_state.pending_bot_msgs.append((role_name, final_text))
                 generated_texts[role_name] = final_text
                 last_bot = final_text
                 last_generated_role = role_name
                 last_generated_text = final_text
+
+                if role_name == "David" and is_david_hurry_message(final_text):
+                    st.session_state.david_hurry_count = st.session_state.get("david_hurry_count", 0) + 1
+
+                if role_name == "David" and should_trigger_team_micro_conflict(
+                    david_text=final_text,
+                    current_hurry_count=st.session_state.get("david_hurry_count", 0),
+                    user_text=text,
+                    reply_to_text=effective_reply_text,
+                ):
+                    conflict_bundle = build_team_micro_conflict(
+                        leadership_style=leadership,
+                        david_text=final_text,
+                        user_text=text,
+                        reply_to_text=effective_reply_text,
+                    )
+                    st.session_state.team_micro_conflict_used = True
+                    st.session_state.last_micro_conflict_turn = st.session_state.turns
+
+                    for conflict_role, conflict_text, conflict_reply_to_role, conflict_reply_to_text in conflict_bundle:
+                        st.session_state.pending_bot_msgs.append((conflict_role, conflict_text))
+                        generated_texts[conflict_role] = conflict_text
+                        last_bot = conflict_text
+                        last_generated_role = conflict_role
+                        last_generated_text = conflict_text
+
 
                 # If Bas says something dumb, sometimes add a correction right after
                 if role_name == "Bas":
@@ -961,7 +1118,10 @@ def page_task():
                 recent_leader_msgs = recent_role_messages("Leader", n=4)
 
                 hint_trigger = False
-                if meta_intent in ["confused", "next_step", "boundary_check", "moon_why"]:
+                recent_conflict_turn = st.session_state.get("last_micro_conflict_turn", -999)
+                if recent_conflict_turn == st.session_state.turns:
+                    hint_trigger = False
+                elif meta_intent in ["confused", "next_step", "boundary_check", "moon_why"]:
                     hint_trigger = False
                 elif explicit_slot is not None or asking_direct_item:
                     hint_trigger = False
@@ -1062,12 +1222,17 @@ Each rank can be used **only once**.
         if still_matches_ui and recent_enough:
             fresh_pending_ui_changes.append(change)
 
-    st.session_state.pending_ui_rank_changes = fresh_pending_ui_changes
-    pending_ui_changes = fresh_pending_ui_changes
+    latest_by_item = {}
+    for change in fresh_pending_ui_changes:
+        latest_by_item[change["item"]] = change
 
-    now = time.time()
+    pending_ui_changes = list(latest_by_item.values())
+    pending_ui_changes.sort(key=lambda x: x.get("created_time", 0.0))
+    pending_ui_changes = pending_ui_changes[-2:]
 
-    ui_reaction_threshold = 2 if len(pending_ui_changes) >= 3 else 3
+    st.session_state.pending_ui_rank_changes = pending_ui_changes
+
+    ui_reaction_threshold = 1
 
     if (
         len(pending_ui_changes) >= ui_reaction_threshold
@@ -1075,7 +1240,8 @@ Each rank can be used **only once**.
         and (now - st.session_state.last_ui_reaction_time) >= 4.0
         and (now - st.session_state.get("last_user_chat_time", 0.0)) >= 6.0
         and not st.session_state.bot_reveal_active
-        and random.random() < 0.30
+        and len(pending_ui_changes) == 1
+        and random.random() < 0.18
     ):
         latest_change = pending_ui_changes[-1]
 
@@ -1130,7 +1296,7 @@ Each rank can be used **only once**.
         st.session_state.data["discussion_log"] = format_discussion_log()
 
         st.session_state.saved = False
-
+        set_survey_stage("likert")
         st.switch_page("pages/1_Likert_Survey.py")
 
 

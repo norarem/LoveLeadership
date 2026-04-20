@@ -1,6 +1,7 @@
 import streamlit as st
 import streamlit.components.v1 as components
 from constants import PILOT_MODE
+from navigation_helpers import require_stage, set_survey_stage, hide_streamlit_page_nav
 
 st.set_page_config(
     page_title="Pilot Feedback",
@@ -8,10 +9,14 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+hide_streamlit_page_nav()
+require_stage("pilot")
+
 def page_pilot_feedback():
     # Safety check: if pilot mode is off, skip this page
     if not PILOT_MODE:
         st.session_state.thankyou_scroll_done = False
+        set_survey_stage("thankyou")
         st.switch_page("pages/3_Thank_You.py")
         return
 

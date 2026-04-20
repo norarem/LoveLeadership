@@ -14,8 +14,8 @@ from text_parsing import (
     extract_rank_from_text,
     detect_rank_range_from_text,
     extract_explicit_slot_request,
+    extract_multiple_rank_assignments,
 )
-
 
 def get_current_ui_ranking():
     """
@@ -304,13 +304,16 @@ def init_ranking_helper_state():
 
 
 def update_group_rank_memory_from_message(text: str, mentioned_items: list):
-    """
-    Store the latest user proposal about item ranks.
-    Saves either:
-    - exact rank: {"type": "exact", "value": 9}
-    - range: {"type": "range", "value": (3, 4)}
-    """
     init_group_rank_memory()
+
+    rank_assignments = extract_multiple_rank_assignments(text)
+    if rank_assignments:
+        for entry in rank_assignments:
+            st.session_state.group_rank_memory[entry["item"]] = {
+                "type": "exact",
+                "value": entry["rank"],
+            }
+        return
 
     if not mentioned_items:
         return
@@ -386,6 +389,30 @@ def update_slot_memory_from_message(text: str, mentioned_items: list):
     explicit_slot = extract_explicit_slot_request(text)
     guessed_rank = extract_rank_from_text(text)
     rank_range = detect_rank_range_from_text(text)
+    rank_assignments = extract_multiple_rank_assignments(text)
+
+    resolved_defaults = {
+        "Two 100-lb tanks of oxygen": 1,
+        "5 gallons of water": 2,
+        "Stellar map (of the moon's constellations)": 3,
+        "Magnetic compass": 14,
+        "Box of matches": 15,
+    }
+
+    if rank_assignments:
+        first_entry = rank_assignments[0]
+        mem["current_focus_slot"] = first_entry["rank"]
+        mem["current_focus_item"] = first_entry["item"]
+
+        for entry in rank_assignments:
+            item = entry["item"]
+            slot = entry["rank"]
+            remember_slot_assignment(
+                item,
+                slot,
+                resolved=(item in resolved_defaults and resolved_defaults[item] == slot),
+            )
+        return
 
     if explicit_slot is not None:
         mem["current_focus_slot"] = explicit_slot
@@ -395,14 +422,6 @@ def update_slot_memory_from_message(text: str, mentioned_items: list):
 
     first_item = mentioned_items[0]
     mem["current_focus_item"] = first_item
-
-    resolved_defaults = {
-        "Two 100-lb tanks of oxygen": 1,
-        "5 gallons of water": 2,
-        "Stellar map (of the moon's constellations)": 3,
-        "Magnetic compass": 14,
-        "Box of matches": 15,
-    }
 
     if guessed_rank is not None:
         for item in mentioned_items:
@@ -421,6 +440,7 @@ def update_slot_memory_from_message(text: str, mentioned_items: list):
 
     if explicit_slot is not None:
         remember_slot_assignment(first_item, explicit_slot, resolved=False)
+
 
 
 def format_slot_memory():

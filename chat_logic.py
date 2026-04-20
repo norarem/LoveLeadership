@@ -1,11 +1,15 @@
 import random
+import re
 import streamlit as st
 
 from constants import (
     GOOD_TOP_ITEMS,
     BAD_TOP_ITEMS,
     NASA_ITEMS,
+    NASA_EXPERT_RANK,
+    NASA_REASONING_SHORT,
 )
+
 
 from text_parsing import (
     short_item_name,
@@ -14,7 +18,9 @@ from text_parsing import (
     evaluate_rank_guess,
     summarize_items_for_reply,
     parse_message_features,
+    normalize_text,
 )
+
 
 from ranking_helpers import (
     get_next_empty_ui_slots,
@@ -22,18 +28,8 @@ from ranking_helpers import (
     classify_rank_quality,
     next_unresolved_slots,
     slot_candidate_text,
-    remember_slot_assignment,
-    format_group_rank_memory,
     get_ranking_context_snapshot,
 )
-
-def get_last_non_user_speaker():
-    """Return the role of the most recent non-user speaker."""
-    chat = st.session_state.get("chat", [])
-    for msg in reversed(chat):
-        if msg.get("role") != "You":
-            return msg.get("role")
-    return None
 
 
 def get_last_item_discussed():
@@ -65,12 +61,6 @@ def get_next_slot_text(limit=3):
         return "the next unresolved slots"
 
     return ", ".join([f"#{x}" for x in next_slots])
-
-
-def items_to_bullets(items):
-    if not items:
-        return "—"
-    return ", ".join(items[:4])
 
 
 def top_slots_already_filled(min_filled=4):
@@ -292,12 +282,84 @@ def sanitize_generated_text(text: str) -> str:
 
     weird_fixes = {
         "pfeelstols": "pistols",
+        "optimfeelstic": "optimistic",
+        "oxygen tanks belongs": "oxygen tanks belong",
+        "matches belongs": "matches belong",
+        "oxygen tanks matters": "oxygen tanks matter",
+        "matches matters": "matches matter",
+        "pistols matters": "pistols matter",
+        "pis probablytols": "pistols",
+        "probablytols": "pistols",
     }
 
     for bad, good in weird_fixes.items():
         text = text.replace(bad, good)
 
     return text
+
+def get_item_reasoning(item: str):
+    return NASA_REASONING_SHORT.get(
+        item,
+        "its direct survival value matters more than Earth-based intuition here"
+    )
+
+
+def build_reasoned_comparison(a: str, b: str):
+    a_short = short_item_name(a)
+    b_short = short_item_name(b)
+    a_reason = get_item_reasoning(a)
+    b_reason = get_item_reasoning(b)
+
+    return (
+        f"{a_short.capitalize()} matters because {a_reason}, "
+        f"while {b_short} matters because {b_reason}."
+    )
+
+def build_theme_guidance(reasoning_themes):
+    parts = []
+
+    if "communication" in reasoning_themes or "rescue" in reasoning_themes:
+        parts.append("that kind of logic supports keeping the transmitter relatively high")
+
+    if "navigation" in reasoning_themes:
+        parts.append("it also supports the stellar map staying high")
+
+    if "survival" in reasoning_themes:
+        parts.append("and it reinforces why oxygen and water stay above almost everything else")
+
+    if "ship_status" in reasoning_themes:
+        parts.append("but we still have to rank only the salvaged items rather than rely on the ship itself")
+
+    if not parts:
+        return "that reasoning should still be translated into direct survival value"
+
+    sentence = ". ".join(part.capitalize() for part in parts)
+    if not sentence.endswith("."):
+        sentence += "."
+    return sentence
+
+def build_progress_redirect(next_slots_text, leadership_style):
+    if leadership_style == "servant":
+        options = [
+            f"The top feels steady enough for now. Let’s work carefully through {next_slots_text} together and make sure everyone stays with the reasoning.",
+            f"We have enough of the strongest anchors to move on. Let’s compare the items around {next_slots_text} in a way that still leaves room for people to weigh in.",
+            f"The top is taking shape. I’d like us to work through {next_slots_text} without rushing anyone past their point.",
+        ]
+    elif leadership_style == "task_focused":
+        options = [
+            f"The top looks stable enough. Work through {next_slots_text} next.",
+            f"Keep the strongest anchors in place and resolve {next_slots_text}.",
+            f"We have enough on the top tier for now. Move to {next_slots_text}.",
+        ]
+    else:
+        options = [
+            f"The top is settled enough. Do {next_slots_text} next.",
+            f"That is enough on the top tier. Move to {next_slots_text}.",
+            f"Stop circling the top. Resolve {next_slots_text}.",
+        ]
+
+    fresh = [opt for opt in options if not leader_recently_used_fragment([opt], n=6)]
+    return random.choice(fresh or options)
 
 
 def style_leader_reply(base_reply, leadership_style, context="general"):
@@ -314,24 +376,35 @@ def style_leader_reply(base_reply, leadership_style, context="general"):
     if leadership_style == "servant":
         prefixes = {
             "general": [
-                "Let’s think it through together. ",
-                "That’s helpful to raise. ",
+                "Thank you for raising that. I want to make sure we give it the attention it deserves. ",
+                "I’m glad you brought that up. Let’s work through it together in a way that feels clear to everyone. ",
+                "I appreciate you naming that. It helps the team, and I want to make sure your point is properly heard. ",
+                "Let’s stay with that for a moment so no one feels rushed past the reasoning. ",
+                "That’s worth slowing down for. Let’s make sure the team feels clear on it before we move on. ",
             ],
             "agreement": [
-                "I appreciate that alignment. ",
-                "That helps the team move forward. ",
+                "I’m glad we’re finding some shared ground. That can help the team feel more steady. ",
+                "It helps when people are building on each other like this. ",
+                "I appreciate that common ground. It gives us something solid to build from together. ",
+                "That kind of alignment can help everyone feel more confident in the decision. ",
             ],
             "disagreement": [
-                "That’s okay — discussion can help us think more carefully. ",
-                "Different views can be useful here. ",
+                "It’s okay to see this differently. I want to make sure both views are heard before we decide. ",
+                "Different views can help us think better, so let’s hold both for a moment and keep the discussion respectful. ",
+                "Let’s slow it down and make room for both sides of the reasoning. ",
+                "That difference is useful. I don’t want anyone to feel talked past here. ",
             ],
             "correction": [
-                "Let’s revisit that gently. ",
-                "I think we should reconsider that together. ",
+                "Let’s adjust that gently and keep everyone with us. ",
+                "I think we can refine that together without losing the progress we’ve made. ",
+                "Let’s revisit that carefully so the reasoning feels clearer and the team can feel confident about the choice. ",
+                "I’d like us to take another look at that in a way that still feels supportive. ",
             ],
             "progress": [
-                "We’re making progress as a team. ",
-                "We’re getting closer together. ",
+                "We’re making thoughtful progress, and I appreciate how people are helping one another think this through. ",
+                "This is moving in a good direction, and I’m glad people are building on each other’s ideas. ",
+                "We’re getting somewhere together, and I want to make sure the discussion still feels open and supportive as we do. ",
+                "I can see the ranking taking shape, and I appreciate the care people are showing in how they respond to each other. ",
             ],
         }
         return random.choice(prefixes.get(context, prefixes["general"])) + base_reply
@@ -340,7 +413,8 @@ def style_leader_reply(base_reply, leadership_style, context="general"):
         prefixes = {
             "general": [
                 "Let’s keep this structured. ",
-                "Let’s start simple. ",
+                "Let’s stay practical. ",
+                "Start with the clearest survival logic. ",
             ],
             "agreement": [
                 "Good. That helps us move forward. ",
@@ -361,8 +435,7 @@ def style_leader_reply(base_reply, leadership_style, context="general"):
         }
         return random.choice(prefixes.get(context, prefixes["general"])) + base_reply
 
-    else:  # authoritarian
-        # lighter prefixing here; richer variation happens in add_authoritarian_human_variation()
+    else:
         prefixes = {
             "general": [
                 "",
@@ -392,6 +465,7 @@ def style_leader_reply(base_reply, leadership_style, context="general"):
         }
         return random.choice(prefixes.get(context, prefixes["general"])) + base_reply
 
+
 def recently_said_by(teammate_name, phrase_fragment, n=8):
     chat = st.session_state.get("chat", [])[-n:]
     for msg in chat:
@@ -400,28 +474,25 @@ def recently_said_by(teammate_name, phrase_fragment, n=8):
     return False
 
 def get_teammate_climate_bias(leadership_style):
-    """
-    Small climate shifts caused by the leader condition.
-    Keep these subtle so the leader remains the main manipulation.
-    """
     if leadership_style == "servant":
         return {
-            "voice": 0.35,
-            "deference": 0.10,
+            "voice": 0.50,
+            "deference": 0.06,
             "closure": 0.10,
         }
     elif leadership_style == "task_focused":
         return {
-            "voice": 0.18,
+            "voice": 0.24,
             "deference": 0.18,
-            "closure": 0.28,
+            "closure": 0.32,
         }
-    else:  # authoritarian
+    else:
         return {
             "voice": 0.08,
             "deference": 0.42,
-            "closure": 0.40,
+            "closure": 0.46,
         }
+
 
 def get_conversation_phase():
     """
@@ -559,10 +630,6 @@ def leader_recently_used_fragment(fragments, n=8):
     )
 
 
-def get_recent_team_positions():
-    return format_group_rank_memory()
-
-
 def detect_user_confidence_style(normalized_text: str):
     if not normalized_text:
         return "neutral"
@@ -647,6 +714,62 @@ def is_settle_and_move_message(user_text, first_item, guessed_rank, normalized_t
     return settling_language and move_on_language and (weak_bottom_item or bottom_rank)
 
 
+def extract_named_teammates_from_text(text: str):
+    t = normalize_text(text)
+    names = []
+    for name in ["Anna", "Bas", "Carlos", "David", "Emily"]:
+        if re.search(rf"\b{name.lower()}\b", t):
+            names.append(name)
+    return names
+
+
+def message_has_substance(text: str):
+    if not text:
+        return False
+
+    t = normalize_text(text)
+
+    if len(t) >= 45:
+        return True
+
+    if extract_items_from_text(t, already_normalized=True):
+        return True
+
+    if re.search(r"\b([1-9]|1[0-5])\b", t):
+        return True
+
+    if any(
+        x in t
+        for x in [
+            "because",
+            "survival",
+            "navigation",
+            "communication",
+            "compare",
+            "higher",
+            "lower",
+            "better",
+            "worse",
+            "top",
+            "bottom",
+        ]
+    ):
+        return True
+
+    return False
+
+
+def message_contains_question(text: str):
+    if not text:
+        return False
+
+    t = normalize_text(text)
+    return "?" in text or t.startswith(
+        ("what", "which", "why", "how", "do ", "does ", "should ", "would ", "is ", "are ")
+    )
+
+
+
 def build_message_context(user_text, proposed_items=None):
     """
     Centralized message/context parsing so leader and teammates
@@ -682,7 +805,73 @@ def build_message_context(user_text, proposed_items=None):
         "normalized_text": features["normalized_text"],
         "confidence_style": detect_user_confidence_style(features["normalized_text"]),
         "ranking_ctx": ranking_ctx,
+        "rank_assignments": features["rank_assignments"],
+        "reasoning_themes": features["reasoning_themes"],
     }
+
+def format_natural_list(items, limit=2, fallback=""):
+    items = items[:limit]
+    if not items:
+        return fallback
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + f" and {items[-1]}"
+
+
+def has_visible_consensus(min_slots=2):
+    filled = get_filled_slots_from_ui()
+    slot_memory = st.session_state.get("slot_memory", {})
+    resolved = slot_memory.get("resolved", {})
+    tentative = slot_memory.get("tentative", {})
+
+    return (
+        len(filled) >= min_slots
+        or len(resolved) >= min_slots
+        or len(tentative) >= min_slots
+    )
+
+def has_group_exact_rank(item: str, rank: int):
+    mem = st.session_state.get("group_rank_memory", {})
+    info = mem.get(item)
+    return isinstance(info, dict) and info.get("type") == "exact" and info.get("value") == rank
+
+
+def summarize_full_ranking_feedback(rank_assignments):
+    summary = {
+        "anchors": [],
+        "too_high": [],
+        "too_low": [],
+    }
+
+    for entry in sorted(rank_assignments, key=lambda x: x["rank"]):
+        item = entry["item"]
+        guessed_rank = entry["rank"]
+        correct_rank = NASA_EXPERT_RANK.get(item)
+
+        if correct_rank is None:
+            continue
+
+        diff = guessed_rank - correct_rank
+        short_name = short_item_name(item)
+
+        if abs(diff) <= 1:
+            summary["anchors"].append(short_name)
+        elif diff < 0:
+            summary["too_high"].append(short_name)
+        else:
+            summary["too_low"].append(short_name)
+
+    for key in summary:
+        deduped = []
+        seen = set()
+        for value in summary[key]:
+            if value not in seen:
+                seen.add(value)
+                deduped.append(value)
+        summary[key] = deduped
+
+    return summary
+
 
 def finalize_leader_reply(base_text, leadership_style, context="general"):
     reply = style_leader_reply(base_text, leadership_style, context=context)
@@ -755,16 +944,163 @@ def leader_reply(leadership_style, user_text):
     explicit_slot = ctx["explicit_slot"]
     asking_direct_item = ctx["asking_direct_item"]
     top_already_done = top_slots_already_filled()
+    rank_assignments = ctx["rank_assignments"]
+    reasoning_themes = ctx["reasoning_themes"]
+    addressed_teammates = extract_named_teammates_from_text(user_text)
 
-    def finish(base_text, context="general"):
+    def finish(base_text, context="general", invite_named=False):
+        if invite_named and addressed_teammates:
+            names = format_natural_list(addressed_teammates, limit=2)
+            if leadership_style == "servant":
+                base_text += f" {names}, I’d especially value your thoughts on that, and if anyone else sees it differently or still feels unsure, there is room to say so too."
+            elif leadership_style == "task_focused":
+                base_text += f" {names}, weigh in on that next."
+            else:
+                base_text += f" {names}, answer that directly."
         return finalize_leader_reply(base_text, leadership_style, context=context)
 
     def next_slot_prompt():
         return get_next_slot_text(limit=3)
 
-    # ----------------------------
-    # META / CONFUSION / MOMENTUM
-    # ----------------------------
+    def rank_hint():
+        if explicit_slot is not None:
+            return explicit_slot
+        if guessed_rank is not None:
+            return guessed_rank
+        if rank_range is not None:
+            return round((rank_range[0] + rank_range[1]) / 2)
+        return None
+
+    if meta_intent == "scenario_question":
+        if leadership_style == "servant":
+            return finish(
+                "Assume the ship is damaged enough that we cannot rely on it, and assume we do not currently have outside contact. Let’s judge only the 15 salvaged items together.",
+                context="general",
+                invite_named=True,
+            )
+        if leadership_style == "task_focused":
+            return finish(
+                "Assume the ship is not usable for transport or communication, and assume no contact has been made yet. Rank only the 15 salvaged items.",
+                context="general",
+                invite_named=True,
+            )
+        return finish(
+            "Assume the ship is unusable and no contact has been made. Rank only the 15 items.",
+            context="general",
+            invite_named=True,
+        )
+
+    if user_intent == "full_ranking_proposal" and rank_assignments:
+        summary = summarize_full_ranking_feedback(rank_assignments)
+        anchors = format_natural_list(summary["anchors"], limit=3, fallback="oxygen tanks and water")
+        too_high = format_natural_list(summary["too_high"], limit=2)
+        too_low = format_natural_list(summary["too_low"], limit=2)
+
+        if leadership_style == "servant":
+            reply = f"Thank you for drafting the full ranking. The strongest anchors are {anchors}."
+            if too_high:
+                reply += f" I’d move {too_high} lower."
+            if too_low:
+                reply += f" I’d bring {too_low} higher."
+            reply += " Then we can fine-tune the middle instead of restarting from scratch."
+            return finish(reply, context="correction" if too_high or too_low else "progress", invite_named=True)
+
+        if leadership_style == "task_focused":
+            reply = f"This full draft is useful. The strongest anchors are {anchors}."
+            if too_high:
+                reply += f" Lower {too_high}."
+            if too_low:
+                reply += f" Raise {too_low}."
+            reply += " Then refine the middle."
+            return finish(reply, context="correction" if too_high or too_low else "progress", invite_named=True)
+
+        reply = f"Good. A full draft is better than drifting. Keep {anchors} as the anchors."
+        if too_high:
+            reply += f" Lower {too_high}."
+        if too_low:
+            reply += f" Raise {too_low}."
+        reply += " Then lock the middle."
+        return finish(reply, context="correction" if too_high or too_low else "progress", invite_named=True)
+
+    if user_intent == "frustration":
+        hostile_language = any(x in normalized_text for x in [
+            "shut up",
+            "hou je bek",
+            "hou je mond",
+            "bek houden",
+            "hou je smoel",
+        ])
+
+        if leadership_style == "servant":
+            return finish(
+                "I can hear the frustration. Let’s reset and make this more useful: give one unresolved item or one comparison, and we’ll respond to that directly.",
+                context="general",
+                invite_named=True,
+            )
+
+        if leadership_style == "task_focused":
+            return finish(
+                "Reset. Name one unresolved item or one comparison, and we’ll handle that directly.",
+                context="general",
+                invite_named=True,
+            )
+
+        if hostile_language:
+            return finish(
+                "Enough. Cut that out and stay on task. Give one unresolved item or one comparison.",
+                context="general",
+            )
+
+        return finish(
+            "Fine. Reset. Give one unresolved item or one comparison, and we’ll answer that directly.",
+            context="general",
+        )
+
+    if reasoning_themes and meta_intent == "none":
+        guidance = build_theme_guidance(reasoning_themes)
+
+        if first_item and explicit_slot is None and guessed_rank is None and rank_range is None:
+            if leadership_style == "servant":
+                return finish(
+                    f"That reasoning is really helpful. It does make a stronger case for {first_item_short}. {guidance} I want to make sure everyone feels clear and comfortable with that logic before we settle the placement.",
+                    context="general",
+                    invite_named=True,
+                )
+
+            if leadership_style == "task_focused":
+                return finish(
+                    f"That logic is useful. It does support {first_item_short}. {guidance} Use that reasoning to judge where it belongs.",
+                    context="general",
+                    invite_named=True,
+                )
+
+            return finish(
+                f"That reasoning points toward {first_item_short}. {guidance} Rank accordingly.",
+                context="general",
+                invite_named=True,
+            )
+
+        if not proposed:
+            if leadership_style == "servant":
+                return finish(
+                    f"That line of reasoning is really helpful. {guidance} I’d like us to use that logic as we place the next items together, while making sure everyone still has room to weigh in.",
+                    context="general",
+                    invite_named=True,
+                )
+
+            if leadership_style == "task_focused":
+                return finish(
+                    f"That logic is useful. {guidance} Use that to guide the next placements.",
+                    context="general",
+                    invite_named=True,
+                )
+
+            return finish(
+                f"That reasoning matters. {guidance} Rank accordingly.",
+                context="general",
+                invite_named=True,
+            )
+
     if meta_intent == "moon_why":
         if leadership_style == "servant":
             return finish(
@@ -782,22 +1118,6 @@ def leader_reply(leadership_style, user_text):
         )
 
     if meta_intent == "boundary_check":
-        if first_item == "Portable heating unit":
-            if leadership_style == "servant":
-                return finish(
-                    "You’re right — if heating is already at 15, it cannot go lower. Treat it as settled enough and move to the next unresolved slot.",
-                    context="progress"
-                )
-            if leadership_style == "task_focused":
-                return finish(
-                    "Correct. If heating is already at 15, stop adjusting it and move on.",
-                    context="progress"
-                )
-            return finish(
-                "Correct. 15 is the floor. Heating is low enough. Move on.",
-                context="progress"
-            )
-
         return finish(
             "Correct. If it is already at 15, stop adjusting it and move on.",
             context="progress"
@@ -813,500 +1133,327 @@ def leader_reply(leadership_style, user_text):
         if leadership_style == "servant":
             return finish(
                 f"That’s okay. The next step is simple: stop revisiting the settled items and focus on {next_slot_prompt()}.",
-                context="general"
+                context="general",
+                invite_named=True,
             )
         if leadership_style == "task_focused":
             return finish(
                 f"Next step: stop repeating settled items and fill {next_slot_prompt()}.",
-                context="general"
+                context="general",
+                invite_named=True,
             )
         return finish(
             f"Next step: fill {next_slot_prompt()}.",
-            context="general"
+            context="general",
+            invite_named=True,
         )
 
     if meta_intent == "next_step":
         return finish(
             f"The next step is to fill {next_slot_prompt()}, not to restart the top of the ranking.",
-            context="progress"
+            context="progress",
+            invite_named=True,
         )
 
-    # ----------------------------
-    # DIRECT SLOT QUESTIONS
-    # ----------------------------
-    if explicit_slot is not None:
+    if explicit_slot is not None and not proposed:
         filled_item = get_item_in_slot(explicit_slot)
         if filled_item is not None:
             filled_short = short_item_name(filled_item)
-
-            if leadership_style == "servant":
-                return finish(
-                    f"#{explicit_slot} already seems to be filled with {filled_short}. Let’s move to {next_slot_prompt()} instead.",
-                    context="progress"
-                )
-            if leadership_style == "task_focused":
-                return finish(
-                    f"#{explicit_slot} is already filled with {filled_short}. Resolve {next_slot_prompt()} next.",
-                    context="progress"
-                )
             return finish(
-                f"#{explicit_slot} is already filled with {filled_short}. Move to {next_slot_prompt()} now.",
-                context="progress"
+                f"#{explicit_slot} already seems to be filled with {filled_short}. Let’s move to {next_slot_prompt()} instead.",
+                context="progress",
+                invite_named=True,
             )
+
         suggestion = slot_candidate_text(explicit_slot)
-
-        if explicit_slot in [4, 5]:
-            if leadership_style == "servant":
-                return finish(
-                    f"For #{explicit_slot}, I’d look at one of the strongest remaining support items — especially {suggestion}. Let’s compare those together.",
-                    context="general"
-                )
-            if leadership_style == "task_focused":
-                return finish(
-                    f"For #{explicit_slot}, the strongest candidates are {suggestion}. Let’s test those against the nearby slots.",
-                    context="general"
-                )
-            return finish(
-                f"For #{explicit_slot}, use {suggestion}. Keep the discussion there and do not drift backward.",
-                context="general"
-            )
-
         if suggestion:
             if leadership_style == "servant":
                 return finish(
                     f"For #{explicit_slot}, I’d look at {suggestion}, depending on what we already placed nearby.",
-                    context="general"
+                    context="general",
+                    invite_named=True,
                 )
             if leadership_style == "task_focused":
                 return finish(
                     f"For #{explicit_slot}, a sensible candidate is {suggestion}. Compare it with the surrounding ranks.",
-                    context="general"
+                    context="general",
+                    invite_named=True,
                 )
             return finish(
                 f"For #{explicit_slot}, use {suggestion}. Keep the group focused on that slot.",
-                context="general"
+                context="general",
+                invite_named=True,
             )
 
-    asking_direct_item = ctx["asking_direct_item"]
-
-    # ----------------------------
-    # SETTLE LOW ITEM + MOVE ON
-    # ----------------------------
     if settle_and_move:
         if leadership_style == "servant":
             return finish(
-                "Yes — matches can sit at the bottom. I’d move on to one of the stronger remaining items next, especially the stellar map or the transmitter.",
-                context="progress"
+                "Yes — that low item can stay near the bottom. I’d move on to one of the stronger remaining items next, especially the stellar map, transmitter, or rope tier.",
+                context="progress",
+                invite_named=True,
             )
         if leadership_style == "task_focused":
             return finish(
-                "Yes. Matches can stay at the bottom. Next, place one of the stronger remaining items — especially the stellar map or the transmitter.",
-                context="progress"
+                "Yes. Leave that low item there. Next, place one of the stronger remaining items and keep moving.",
+                context="progress",
+                invite_named=True,
             )
         return finish(
-            "Fine. Matches stay at the bottom. Next, place the stellar map or transmitter high and move on.",
-            context="progress"
+            "Fine. Leave it low. Place a stronger item next and continue.",
+            context="progress",
+            invite_named=True,
         )
 
-    # ----------------------------
-    # DIRECT ITEM QUESTIONS
-    # ----------------------------
-    if asking_direct_item:
+    if first_item and (asking_direct_item or guessed_rank is not None or rank_range is not None or explicit_slot is not None):
+        candidate_rank = rank_hint()
+
+        if first_item == "Two 100-lb tanks of oxygen" and candidate_rank == 1:
+            return finish("Yes — oxygen is the strongest candidate for #1.", context="progress", invite_named=True)
+
+        if first_item == "5 gallons of water" and candidate_rank == 1:
+            return finish(
+                "Water is essential, but I would still keep oxygen at #1 and water at #2.",
+                context="correction",
+                invite_named=True,
+            )
+
+        if first_item == "5 gallons of water" and candidate_rank == 2:
+            return finish("Yes — water is a strong fit for #2.", context="progress", invite_named=True)
+
         if current_ui_rank is not None:
             quality = classify_rank_quality(first_item, current_ui_rank)
-
-            if leadership_style == "servant":
-                if quality == "strong":
-                    return finish(
-                        f"You currently have {first_item_short} at #{current_ui_rank}, and that seems quite reasonable. We can keep it there unless another item clearly deserves the slot more.",
-                        context="progress"
-                    )
-                elif quality == "okay":
-                    return finish(
-                        f"You currently have {first_item_short} at #{current_ui_rank}, which is in a reasonable range. I’d compare it with the nearby items before changing it.",
-                        context="general"
-                    )
-                else:
-                    return finish(
-                        f"You currently have {first_item_short} at #{current_ui_rank}, but that is probably not the strongest placement. I’d reconsider it based on direct survival value.",
-                        context="correction"
-                    )
-
-            elif leadership_style == "task_focused":
-                if quality == "strong":
-                    return finish(
-                        f"You currently have {first_item_short} at #{current_ui_rank}. That is a workable placement. Keep it unless a stronger comparison appears.",
-                        context="progress"
-                    )
-                elif quality == "okay":
-                    return finish(
-                        f"You currently have {first_item_short} at #{current_ui_rank}. That is in a reasonable range, but compare it with the adjacent items before locking it in.",
-                        context="general"
-                    )
-                else:
-                    return finish(
-                        f"You currently have {first_item_short} at #{current_ui_rank}. That is probably not the most efficient placement. Adjust it if a stronger item belongs there.",
-                        context="correction"
-                    )
-
-            else:  # authoritarian
-                if quality == "strong":
-                    return finish(
-                        f"You have {first_item_short} at #{current_ui_rank}. That is fine. Leave it and move on.",
-                        context="progress"
-                    )
-                elif quality == "okay":
-                    return finish(
-                        f"You have {first_item_short} at #{current_ui_rank}. That is acceptable for now, but do not get stuck on it.",
-                        context="general"
-                    )
-                else:
-                    return finish(
-                        f"You have {first_item_short} at #{current_ui_rank}. That is not the strongest slot. Fix it and continue.",
-                        context="correction"
-                    )
-        
-        if first_item == "Self-inflating life raft":
-            if leadership_style == "servant":
+            if quality == "strong":
                 return finish(
-                    "The life raft is more of a lower-middle item. I would place it roughly around #8–#10, not near the very top.",
-                    context="general"
+                    f"You currently have {first_item_short} at #{current_ui_rank}, and that seems strong enough to keep unless a better comparison appears.",
+                    context="progress",
+                    invite_named=True,
                 )
-            if leadership_style == "task_focused":
+            if quality == "okay":
                 return finish(
-                    "The life raft belongs roughly in the #8–#10 range.",
-                    context="general"
+                    f"You currently have {first_item_short} at #{current_ui_rank}, which is a plausible range. I’d compare it with the nearby items before changing it.",
+                    context="general",
+                    invite_named=True,
                 )
             return finish(
-                "Life raft is mid-to-low. Around #8–#10.",
-                context="general"
+                f"You currently have {first_item_short} at #{current_ui_rank}, but that is probably not the strongest placement.",
+                context="correction",
+                invite_named=True,
             )
 
-        if first_item == "Portable heating unit":
-            if guessed_rank == 15:
+        if first_item in GOOD_TOP_ITEMS:
+            if candidate_rank is not None and candidate_rank > 6:
                 return finish(
-                    "That is fine as a bottom placement. Stop adjusting the heating unit now and move on.",
-                    context="progress"
+                    f"{first_item_short.capitalize()} should stay much higher than that.",
+                    context="correction",
+                    invite_named=True,
                 )
             return finish(
-                "Heating unit belongs low, roughly in the #13–#15 range.",
-                context="general"
+                f"{first_item_short.capitalize()} belongs relatively high in the ranking.",
+                context="general",
+                invite_named=True,
             )
 
-        if first_item == "Box of matches":
+        if first_item in BAD_TOP_ITEMS:
+            if candidate_rank is not None and candidate_rank <= 10:
+                return finish(
+                    f"{first_item_short.capitalize()} is too high there. Keep it near the bottom.",
+                    context="correction",
+                    invite_named=True,
+                )
             return finish(
-                "Matches belong very near the bottom.",
-                context="general"
-            )
-
-        if first_item == "Magnetic compass":
-            return finish(
-                "Compass belongs very near the bottom as well.",
-                context="general"
+                f"{first_item_short.capitalize()} belongs relatively low in the ranking.",
+                context="general",
+                invite_named=True,
             )
 
         if first_item == "One case of dehydrated milk":
             return finish(
                 "Dehydrated milk is more of a lower-middle item, roughly around #11–#12 rather than near the top.",
-                context="general"
+                context="general",
+                invite_named=True,
             )
 
         if first_item == "50 feet of nylon rope":
             return finish(
-                "Nylon rope is a solid middle item, roughly around #6.",
-                context="general"
+                "Nylon rope is a solid middle item, roughly around #6–#7.",
+                context="general",
+                invite_named=True,
             )
 
         if first_item == "Parachute silk":
             return finish(
                 "Parachute silk is usually a useful middle item, roughly around #8.",
-                context="general"
+                context="general",
+                invite_named=True,
+            )
+
+        if first_item == "Self-inflating life raft":
+            return finish(
+                "The life raft is more of a lower-middle item, roughly around #8–#10.",
+                context="general",
+                invite_named=True,
             )
 
         if first_item == "First aid kit (including injection needle)":
             return finish(
                 "First aid kit is a fairly useful middle item, roughly around #7.",
-                context="general"
+                context="general",
+                invite_named=True,
             )
 
         if first_item == "Signal flares":
             return finish(
                 "Signal flares are more lower-middle, roughly around #10.",
-                context="general"
+                context="general",
+                invite_named=True,
             )
 
         if first_item == "Two .45 caliber pistols":
             return finish(
                 "Pistols are more lower-middle, roughly around #11.",
-                context="general"
+                context="general",
+                invite_named=True,
             )
 
-        if first_item in GOOD_TOP_ITEMS:
-            return finish(
-                f"{first_item_short.capitalize()} belongs relatively high in the ranking.",
-                context="general"
-            )
-
-        if first_item in BAD_TOP_ITEMS:
-            return finish(
-                f"{first_item_short.capitalize()} belongs relatively low in the ranking.",
-                context="general"
-            )
-
-    # ----------------------------
-    # MULTI-ITEM PROPOSALS
-    # ----------------------------
     if user_intent == "multi_item_proposal" and proposed:
         summary = summarize_items_for_reply(proposed)
 
         if label == "good":
-            next_slots = next_slot_prompt()
-
-            if next_slots == "#1, #2, #3":
-                if leadership_style == "servant":
-                    return finish(
-                        f"That is a strong start ({summary}). I’d keep oxygen and water near the top, then work through the rest of the top five together.",
-                        context="progress"
-                    )
-                if leadership_style == "task_focused":
-                    return finish(
-                        f"That is a strong start ({summary}). Keep oxygen and water near the top, then fill the remaining top-five slots.",
-                        context="progress"
-                    )
-                return finish(
-                    f"That is a strong start ({summary}). Keep oxygen and water near the top. Then fill the remaining top-five slots.",
-                    context="progress"
-                )
-
             return finish(
-                f"That is a workable direction ({summary}). Keep those stronger items near the top, then move to {next_slots}.",
-                context="progress"
+                f"That is a workable direction ({summary}). Keep the strongest items high, then resolve {next_slot_prompt()}.",
+                context="progress",
+                invite_named=True,
             )
 
         if label == "mixed":
             return finish(
-                f"That is partly workable ({summary}). Keep the stronger items high and replace the weak ones.",
-                context="correction"
+                f"That is partly workable ({summary}). Keep the stronger items high and replace the weaker ones.",
+                context="correction",
+                invite_named=True,
             )
 
         if label == "bad":
             return finish(
                 f"That is not the strongest direction ({summary}). Rebuild around oxygen, water, map, and transmitter.",
-                context="correction"
+                context="correction",
+                invite_named=True,
             )
 
-    # ----------------------------
-    # RANK PROPOSALS
-    # ----------------------------
-    if first_item and (guessed_rank or rank_range):
-        if rank_range:
-            low, high = rank_range
-            center_guess = round((low + high) / 2)
-            eval_rank = evaluate_rank_guess(first_item, center_guess)
-            rank_text = f"#{low} or #{high}"
-        else:
-            eval_rank = evaluate_rank_guess(first_item, guessed_rank)
-            rank_text = f"#{guessed_rank}"
-
-        if first_item == "Portable heating unit":
-            if guessed_rank == 15:
-                remember_slot_assignment(first_item, 15, resolved=True)
-                return finish(
-                    "That is acceptable as a bottom-tier placement. Stop adjusting it now and move to the next unresolved slot.",
-                    context="progress"
-                )
-            return finish(
-                f"Heating unit around {rank_text} is in the bottom-tier zone. That is fine enough. Move on.",
-                context="progress"
-            )
-
-        if first_item == "Box of matches":
-            return finish(
-                f"Matches around {rank_text} is still too high. They belong very near the bottom.",
-                context="correction"
-            )
-
-        if first_item == "One case of dehydrated milk":
-            return finish(
-                f"Dehydrated milk around {rank_text} is too high. Keep map and transmitter above it.",
-                context="correction"
-            )
-
-        if first_item == "Self-inflating life raft":
-            if eval_rank == "very_close" or eval_rank == "reasonable":
-                return finish(
-                    f"Life raft around {rank_text} is plausible. Do not over-tune it; move on.",
-                    context="progress"
-                )
-            return finish(
-                f"Life raft around {rank_text} is not ideal. Keep it more in the lower-middle range.",
-                context="correction"
-            )
+    if question_type == "why" and first_item:
+        reason = get_item_reasoning(first_item)
 
         if leadership_style == "servant":
-            if eval_rank == "very_close":
-                return finish(
-                    f"{first_item_short.capitalize()} around {rank_text} seems quite reasonable. Move to the next item.",
-                    context="progress"
-                )
-            elif eval_rank == "reasonable":
-                return finish(
-                    f"{first_item_short.capitalize()} is in a plausible range. I would stop fine-tuning it and move on.",
-                    context="progress"
-                )
-            else:
-                return finish(
-                    f"{first_item_short.capitalize()} is usually not placed around {rank_text}. Adjust it and continue.",
-                    context="correction"
-                )
+            return finish(
+                f"I’d place {first_item_short} based on the fact that {reason}. I want us to make the reasoning clear enough that everyone feels comfortable with the decision before we lock it in.",
+                context="general",
+                invite_named=True,
+            )
 
         if leadership_style == "task_focused":
-            if eval_rank == "very_close":
-                return finish(
-                    f"{first_item_short.capitalize()} around {rank_text} is a workable placement. Move on.",
-                    context="progress"
-                )
-            elif eval_rank == "reasonable":
-                return finish(
-                    f"{first_item_short.capitalize()} around {rank_text} is close enough. Move on.",
-                    context="progress"
-                )
-            else:
-                return finish(
-                    f"{first_item_short.capitalize()} around {rank_text} is not optimal. Adjust it and continue.",
-                    context="correction"
-                )
-
-        if eval_rank == "very_close":
             return finish(
-                f"{first_item_short.capitalize()} around {rank_text} is acceptable. Move on.",
-                context="progress"
+                f"{first_item_short.capitalize()} should be judged by the fact that {reason}.",
+                context="general",
+                invite_named=True,
             )
-        elif eval_rank == "reasonable":
-            return finish(
-                f"{first_item_short.capitalize()} is close enough. Move on.",
-                context="progress"
-            )
-        else:
-            return finish(
-                f"{first_item_short.capitalize()} does not belong around {rank_text}. Fix it and continue.",
-                context="correction"
-            )
-
-    # ----------------------------
-    # WHY / COMPARISON / AGREEMENT / DISAGREEMENT
-    # ----------------------------
-    if question_type == "why" and first_item:
-        why_map = {
-            "Two 100-lb tanks of oxygen": "because oxygen is immediately critical for survival",
-            "5 gallons of water": "because water remains essential for survival, even if oxygen comes first",
-            "Stellar map (of the moon's constellations)": "because navigation matters more on the moon than many people first assume",
-            "Solar-powered FM receiver-transmitter": "because communication can directly support rescue and coordination",
-            "Food concentrate": "because food matters, but not as immediately as oxygen, water, or navigation",
-            "Portable heating unit": "because the moon scenario changes how useful heating really is",
-            "Box of matches": "because matches depend on conditions that are not useful in this scenario",
-            "Magnetic compass": "because magnetic navigation does not work here the way people expect",
-        }
-
-        reason = why_map.get(
-            first_item,
-            f"because {first_item_short} has to be judged by direct survival value under moon conditions"
-        )
 
         return finish(
-            f"{first_item_short.capitalize()} should be judged that way {reason}.",
-            context="general"
+            f"{first_item_short.capitalize()} matters because {reason}. Rank it accordingly.",
+            context="general",
+            invite_named=True,
         )
 
     if question_type == "comparison" and len(proposed) >= 2:
+        pair = {proposed[0], proposed[1]}
+        if pair == {"Two 100-lb tanks of oxygen", "5 gallons of water"}:
+            if leadership_style == "servant":
+                return finish(
+                    "Both are essential, but I would still place oxygen at #1 and water at #2.",
+                    context="general",
+                    invite_named=True,
+                )
+            if leadership_style == "task_focused":
+                return finish(
+                    "Keep oxygen at #1 and water at #2.",
+                    context="general",
+                    invite_named=True,
+                )
+            return finish(
+                "Oxygen first. Water second.",
+                context="general",
+                invite_named=True,
+            )
+
         a, b = proposed[0], proposed[1]
+        comparison_logic = build_reasoned_comparison(a, b)
+
+        if leadership_style == "servant":
+            return finish(
+                f"Let’s compare them carefully. {comparison_logic} I’d place the one with the more immediate survival value first, but I want us to hear the reasoning before we settle it.",
+                context="general",
+                invite_named=True,
+            )
+
+        if leadership_style == "task_focused":
+            return finish(
+                f"{comparison_logic} Place the one with the more immediate survival value first.",
+                context="general",
+                invite_named=True,
+            )
+
         return finish(
-            f"Compare {short_item_name(a)} and {short_item_name(b)} by asking which one contributes more directly to survival, navigation, or rescue. Then place the stronger one first.",
-            context="general"
+            f"{comparison_logic} Put the stronger one first and move on.",
+            context="general",
+            invite_named=True,
         )
 
     if question_type == "agreement":
         return finish(
             "Good. Use that agreement to keep the ranking moving.",
-            context="agreement"
+            context="agreement",
+            invite_named=True,
         )
 
     if question_type == "disagreement":
         return finish(
             "Then state the better alternative clearly and keep moving.",
-            context="disagreement"
+            context="disagreement",
+            invite_named=True,
         )
 
-    if top_already_done and not explicit_slot and meta_intent == "none":
-        if leadership_style == "authoritarian":
-            return finish(
-                f"The top of the ranking is already mostly settled. Keep the group on {next_slot_prompt()} now.",
-                context="progress"
-            )
-        if leadership_style == "task_focused":
-            return finish(
-                f"The strongest items are already mostly in place. Focus now on resolving {next_slot_prompt()}.",
-                context="progress"
-            )
+    if top_already_done:
         return finish(
-            f"We already seem to have the strongest items mostly placed. Let’s work through {next_slot_prompt()} together.",
-            context="progress"
+            build_progress_redirect(next_slot_prompt(), leadership_style),
+            context="progress",
+            invite_named=True,
         )
 
-    # ----------------------------
-    # CONTINUITY FALLBACK
-    # ----------------------------
+
     if remembered_slots:
-        memory_count = remembered_slots.count("#")
-
-        if memory_count >= 5:
-            if leadership_style == "authoritarian":
-                return finish(
-                    f"We already have {remembered_slots}. Keep the group on {next_slot_prompt()} now.",
-                    context="progress"
-                )
-            if leadership_style == "task_focused":
-                return finish(
-                    f"So far we have {remembered_slots}. Next, resolve {next_slot_prompt()} efficiently.",
-                    context="progress"
-                )
-            return finish(
-                f"So far we seem to have {remembered_slots}. Let’s build on that by working through {next_slot_prompt()} together.",
-                context="progress"
-            )
-
-        if leadership_style == "authoritarian":
-            return finish(
-                f"We have a partial structure already. Stay with {next_slot_prompt()} now.",
-                context="progress"
-            )
-        if leadership_style == "task_focused":
-            return finish(
-                f"We have part of the ranking sketched out. Now resolve {next_slot_prompt()}.",
-                context="progress"
-            )
         return finish(
-            f"We have part of the ranking taking shape. Let’s keep working through {next_slot_prompt()} together.",
-            context="progress"
+            f"So far we seem to have {remembered_slots}. {build_progress_redirect(next_slot_prompt(), leadership_style)}",
+            context="progress",
+            invite_named=True,
         )
 
-    # fallback
     if leadership_style == "servant":
-        fallback = "Name two or three items you think matter most and we’ll refine them."
-        if leader_recently_used_fragment(["two or three items", "we’ll refine them"]):
-            fallback = f"Start with the items you think belong near the top, then we’ll work through {next_slot_prompt()}."
-        return finish(fallback, context="general")
+        return finish(
+            f"Start with the items you think belong near the top, and we’ll refine them together from there.",
+            context="general",
+            invite_named=True,
+        )
 
     if leadership_style == "task_focused":
-        fallback = "Give me your top three. Focus on direct survival value first."
-        if leader_recently_used_fragment(["give me your top three", "direct survival value"]):
-            fallback = f"Start with the strongest items first, then fill {next_slot_prompt()}."
-        return finish(fallback, context="general")
+        return finish(
+            f"Start with the strongest items first, then fill {next_slot_prompt()}.",
+            context="general",
+            invite_named=True,
+        )
 
-    fallback = "State your top three items now."
-    if leader_recently_used_fragment(["state your top three items now"]):
-        fallback = f"Start with the strongest remaining items and move through {next_slot_prompt()}."
-    return finish(fallback, context="general")
+    return finish(
+        f"State the strongest remaining items and move through {next_slot_prompt()}.",
+        context="general",
+        invite_named=True,
+    )
 
 
 
@@ -1332,65 +1479,31 @@ def teammate_reply_persona(
     meta_intent = ctx["meta_intent"]
 
     first_item = ctx["first_item"]
-    last_speaker = get_last_non_user_speaker()
     user_item = first_item
     current_ui_rank = ctx["current_ui_rank"]
     phase = get_conversation_phase()
     top_already_done = top_slots_already_filled()
     remembered_slots = ctx["remembered_slots"]
     explicit_slot = ctx["explicit_slot"]
-    if explicit_slot is not None:
-        filled_item = get_item_in_slot(explicit_slot)
-        if filled_item is not None:
-            filled_short = short_item_name(filled_item)
-
-            pools = {
-                "Anna": [
-                    f"I think #{explicit_slot} already looks filled with {filled_short}.",
-                    f"{filled_short.capitalize()} already seems to be sitting at #{explicit_slot}."
-                ],
-                "Bas": [
-                    f"Yeah, I think {filled_short} is already there.",
-                    f"Isn’t #{explicit_slot} already {filled_short}?"
-                ],
-                "Carlos": [
-                    f"I think #{explicit_slot} is already occupied by {filled_short} 😄",
-                    f"Pretty sure {filled_short} already lives at #{explicit_slot}."
-                ],
-                "David": [
-                    f"#{explicit_slot} is already {filled_short}. Move on.",
-                    f"That slot is already taken. Next."
-                ],
-                "Emily": [
-                    f"I think #{explicit_slot} is already filled by {filled_short}.",
-                    f"{filled_short.capitalize()} already appears to occupy #{explicit_slot}."
-                ],
-            }
-            return safe_pick(
-                pools[teammate_name],
-                f"#{explicit_slot} already seems filled with {filled_short}."
-            )
-        first_item = None
-        user_item = None
-        current_ui_rank = None
     lower_text = ctx["normalized_text"]
     asking_direct_item = ctx["asking_direct_item"]
     confidence_style = ctx["confidence_style"]
+    user_intent = ctx["user_intent"]
     reply_to_role = reply_to_role or ""
     reply_to_text = reply_to_text or ""
-    settle_and_move = is_settle_and_move_message(
-        user_text=user_text,
-        first_item=first_item,
-        guessed_rank=guessed_rank,
-        normalized_text=lower_text,
-    )
-    reply_to_items = extract_items_from_text(reply_to_text)
-    reply_to_item = reply_to_items[0] if reply_to_items else None
+    rank_assignments = ctx["rank_assignments"]
+    reasoning_themes = ctx["reasoning_themes"]
 
-    def pick(options):
-        if not options:
-            return ""
-        return options[step % len(options)]
+    clarification_request = any(x in lower_text for x in [
+        "what do you mean",
+        "what do you mean by that",
+        "why do you think",
+        "why do you say",
+        "how do you mean",
+    ])
+
+    addressed_teammates = extract_named_teammates_from_text(user_text)
+    directly_addressed = teammate_name in addressed_teammates
 
     def safe_pick(options, fallback):
         shuffled = options[:]
@@ -1409,12 +1522,10 @@ def teammate_reply_persona(
         candidate = add_teammate_tail(teammate_name, candidate, phase=phase)
         candidate = sanitize_generated_text(candidate)
         return candidate
-    
+
     def maybe_disagree(base_text, alt_text):
         disagreement_allowed = should_allow_teammate_disagreement(teammate_name, leadership_style)
 
-        # authoritarian -> less open disagreement
-        # servant -> slightly more voice
         if leadership_style == "authoritarian":
             disagreement_allowed = disagreement_allowed and random.random() < 0.70
         elif leadership_style == "servant":
@@ -1434,33 +1545,648 @@ def teammate_reply_persona(
         else:
             align_prob *= 1.20
 
-        if "Leader" in (reply_to_role or "") and random.random() < align_prob:
+        if "Leader" in reply_to_role and random.random() < align_prob:
             return maybe_soften_certainty(aligned_text, teammate_name)
 
         return maybe_soften_certainty(base_text, teammate_name)
+
+    def rank_hint():
+        if current_ui_rank is not None:
+            return current_ui_rank
+        if explicit_slot is not None:
+            return explicit_slot
+        if guessed_rank is not None:
+            return guessed_rank
+        if rank_range is not None:
+            return round((rank_range[0] + rank_range[1]) / 2)
+        return None
+
+    def initiative_prompt():
+        pools = {
+            "Anna": [
+                "I’d probably compare first aid kit and nylon rope next. Which one feels stronger to you?",
+                "We could sort out the middle by comparing parachute silk, rope, and first aid. That might help.",
+                "Emily, would you still keep the map above the transmitter, or not?",
+            ],
+            "Bas": [
+                "Maybe we compare rope and first aid next? I’m honestly not sure which one wins.",
+                "Do we think life raft should stay below parachute silk, or am I overthinking that?",
+                "Would rope beat flares for you, or not really?",
+            ],
+            "Carlos": [
+                "Can we settle whether the map beats the transmitter before the moon starts judging us again? 😄",
+                "Are we treating the top four as settled now, or not yet?",
+                "Should we compare rope, first aid, and parachute silk next instead of bouncing around? 😄",
+            ],
+            "David": [
+                "Can someone lock one of the middle slots so we stop circling?",
+                "Pick the stronger middle item and place it.",
+                "Do map, rope, or first aid next. Just choose one.",
+            ],
+            "Emily": [
+                "I think we should compare rope, first aid, and parachute silk next, because they sit in a similar band.",
+                "Would you rather resolve the map/transmitter tier fully first, or move straight to the middle items?",
+                "Carlos, do you still think the transmitter belongs above food, or would you switch them?",
+            ],
+        }
+        return safe_pick(pools[teammate_name], "We should compare the next middle items directly.")
+
+    def is_low_priority_item(item):
+        rank = NASA_EXPERT_RANK.get(item)
+        return rank is not None and rank >= 12
+
+    def prior_reply_already_reasoned_about(item):
+        if not reply_to_text:
+            return False
+
+        lowered = normalize_text(reply_to_text)
+        short_name = short_item_name(item)
+        reason = get_item_reasoning(item)
+        reason_core = reason.split(",")[0]
+
+        return (
+            short_name in lowered
+            and (
+                "because" in lowered
+                or reason_core in lowered
+            )
+        )
+
+    def reasoned_item_take(item):
+        short_name = short_item_name(item)
+        reason = get_item_reasoning(item)
+
+        if prior_reply_already_reasoned_about(item):
+            followup_pools = {
+                "Anna": [
+                    f"That logic makes sense to me. I’d just compare {short_name} with the nearby items before locking it in.",
+                    f"I can follow that reasoning. I’d just test {short_name} against the nearby placements before settling it.",
+                ],
+                "Bas": [
+                    f"Yeah, I can go with that logic. I’d just compare {short_name} with the nearby items once more.",
+                    f"That sounds fair to me. I’d still test {short_name} against the surrounding ranks though.",
+                ],
+                "Carlos": [
+                    f"Yeah, fair 😄 I don’t need to repeat the same logic, but I’d still compare {short_name} with the nearby items.",
+                    f"That reasoning tracks 😄 I’d just test {short_name} against the neighboring spots before we lock it.",
+                ],
+                "David": [
+                    f"Fine. That logic is already on the table. Compare {short_name} once, then move on.",
+                    f"We already have the reason. Test {short_name} against the nearby item and continue.",
+                ],
+                "Emily": [
+                    f"That reasoning is already fairly clear, so the next useful step is comparing {short_name} with the nearby candidates.",
+                    f"I think the logic has already been stated. What matters now is whether {short_name} beats the neighboring items.",
+                ],
+            }
+            return safe_pick(
+                followup_pools[teammate_name],
+                f"The logic for {short_name} is already fairly clear; now compare it with the nearby items."
+            )
+
+        if is_low_priority_item(item):
+            pools = {
+                "Anna": [
+                    f"I’d keep {short_name} lower because {reason}.",
+                    f"For me, {short_name} should stay low because {reason}.",
+                ],
+                "Bas": [
+                    f"I’d keep {short_name} pretty low because {reason}.",
+                    f"{short_name.capitalize()} sounds intuitive, but I’d still rank it lower because {reason}.",
+                ],
+                "Carlos": [
+                    f"I’d keep {short_name} low because {reason} 😄",
+                    f"{short_name.capitalize()} is giving false confidence energy, because {reason} 😄",
+                ],
+                "David": [
+                    f"{short_name.capitalize()} should stay low because {reason}. Use that and move on.",
+                    f"Simple: keep {short_name} low because {reason}.",
+                ],
+                "Emily": [
+                    f"{short_name.capitalize()} should stay low because {reason}.",
+                    f"I’d rank {short_name} lower on the basis that {reason}.",
+                ],
+            }
+            return safe_pick(
+                pools[teammate_name],
+                f"{short_name.capitalize()} should stay low because {reason}."
+            )
+
+        pools = {
+            "Anna": [
+                f"I’d keep {short_name} in mind because {reason}.",
+                f"For me, {short_name} matters because {reason}.",
+            ],
+            "Bas": [
+                f"I think {short_name} is stronger than it sounds because {reason}.",
+                f"{short_name.capitalize()} gets points from me because {reason}.",
+            ],
+            "Carlos": [
+                f"{short_name.capitalize()} actually matters because {reason} 😄",
+                f"I’d give {short_name} credit because {reason}.",
+            ],
+            "David": [
+                f"{short_name.capitalize()} matters because {reason}. Use that and move on.",
+                f"Simple: {short_name} matters because {reason}. Rank it accordingly.",
+            ],
+            "Emily": [
+                f"{short_name.capitalize()} should be judged by the fact that {reason}.",
+                f"I’d rank {short_name} based on the fact that {reason}.",
+            ],
+        }
+
+        return safe_pick(
+            pools[teammate_name],
+            f"{short_name.capitalize()} matters because {reason}."
+        )
+
+    def reasoned_comparison_take(a, b):
+        a_short = short_item_name(a)
+        b_short = short_item_name(b)
+        a_reason = get_item_reasoning(a)
+        b_reason = get_item_reasoning(b)
+
+        pools = {
+            "Anna": [
+                f"I’d compare them this way: {a_short} matters because {a_reason}, while {b_short} matters because {b_reason}.",
+            ],
+            "Bas": [
+                f"For me, it comes down to this: {a_short} matters because {a_reason}, but {b_short} matters because {b_reason}.",
+            ],
+            "Carlos": [
+                f"If we do actual moon logic, {a_short} matters because {a_reason}, while {b_short} matters because {b_reason} 😄",
+            ],
+            "David": [
+                f"{a_short.capitalize()} matters because {a_reason}. {b_short.capitalize()} matters because {b_reason}. Pick the stronger one.",
+            ],
+            "Emily": [
+                f"I’d compare them by function: {a_short} matters because {a_reason}, while {b_short} matters because {b_reason}.",
+            ],
+        }
+
+        return safe_pick(
+            pools[teammate_name],
+            f"{a_short.capitalize()} matters because {a_reason}, while {b_short} matters because {b_reason}."
+        )
+
+    def answer_about_item(item, direct=False):
+        short_name = short_item_name(item)
+        hinted_rank = rank_hint()
+
+        if current_ui_rank is not None:
+            quality = classify_rank_quality(item, current_ui_rank)
+            pools = {
+                "Anna": {
+                    "strong": [
+                        f"I’d probably keep {short_name} at #{current_ui_rank}. That seems pretty reasonable.",
+                        f"{short_name.capitalize()} at #{current_ui_rank} feels quite solid to me.",
+                    ],
+                    "okay": [
+                        f"{short_name.capitalize()} at #{current_ui_rank} seems workable, though I’d compare it with the nearby items.",
+                        f"I could see {short_name} staying at #{current_ui_rank}, but it depends on what sits around it.",
+                    ],
+                    "weak": [
+                        f"I’d probably rethink {short_name} at #{current_ui_rank}. That feels a bit off to me.",
+                        f"{short_name.capitalize()} at #{current_ui_rank} does not feel like the strongest fit.",
+                    ],
+                },
+                "Bas": {
+                    "strong": [
+                        f"Yeah, {short_name} at #{current_ui_rank} sounds fair.",
+                        f"Okay, I can see {short_name} staying there.",
+                    ],
+                    "okay": [
+                        f"Maybe {short_name} at #{current_ui_rank} works, honestly.",
+                        f"I can kind of see that placement for {short_name}.",
+                    ],
+                    "weak": [
+                        f"Hm, {short_name} at #{current_ui_rank} feels a bit weird, even to me.",
+                        f"I might move {short_name} somewhere else, honestly.",
+                    ],
+                },
+                "Carlos": {
+                    "strong": [
+                        f"Honestly, {short_name} at #{current_ui_rank} looks pretty decent 😄",
+                        f"That slot for {short_name} actually feels kind of solid.",
+                    ],
+                    "okay": [
+                        f"{short_name.capitalize()} at #{current_ui_rank} is not a disaster 😄",
+                        f"That placement for {short_name} seems discussable.",
+                    ],
+                    "weak": [
+                        f"{short_name.capitalize()} at #{current_ui_rank} feels a little cursed 😄",
+                        f"I’m not fully sold on {short_name} living at #{current_ui_rank}.",
+                    ],
+                },
+                "David": {
+                    "strong": [
+                        f"Fine. Keep {short_name} at #{current_ui_rank}. Next.",
+                        f"That works for {short_name}. Move on.",
+                    ],
+                    "okay": [
+                        f"Close enough for now. Keep moving.",
+                        f"That slot is workable. Next item.",
+                    ],
+                    "weak": [
+                        f"No, I’d move {short_name} from #{current_ui_rank}.",
+                        f"That’s not the best slot. Fix it and move on.",
+                    ],
+                },
+                "Emily": {
+                    "strong": [
+                        f"That placement for {short_name} is defensible.",
+                        f"{short_name.capitalize()} at #{current_ui_rank} is in a strong range.",
+                    ],
+                    "okay": [
+                        f"{short_name.capitalize()} at #{current_ui_rank} is in a plausible range, though not necessarily exact.",
+                        f"I can defend that placement, but I would still compare it carefully.",
+                    ],
+                    "weak": [
+                        f"I don’t think {short_name} is best placed at #{current_ui_rank}.",
+                        f"That placement for {short_name} is probably not optimal.",
+                    ],
+                },
+            }
+
+            quality_key = quality if quality in ["strong", "okay", "weak"] else "okay"
+            return safe_pick(
+                pools[teammate_name][quality_key],
+                f"{short_name.capitalize()} is currently at #{current_ui_rank}."
+            )
+        
+        if direct or question_type == "why":
+            return reasoned_item_take(item)
+
+        if item == "Two 100-lb tanks of oxygen":
+            pools = {
+                "Anna": ["I’d still put oxygen first."],
+                "Bas": ["Yeah, oxygen feels like the safest bet for the top."],
+                "Carlos": ["Oxygen still feels like the moon MVP to me 😄"],
+                "David": ["Oxygen first. Move on."],
+                "Emily": ["Oxygen should remain at or near the very top."],
+            }
+            return safe_pick(pools[teammate_name], "Oxygen should be at the top.")
+
+        if item == "5 gallons of water":
+            pools = {
+                "Anna": ["Water is definitely top-tier, though I’d still keep oxygen just above it."],
+                "Bas": ["Water sounds extremely high to me, just maybe not above oxygen."],
+                "Carlos": ["Water is elite-tier, just probably not above oxygen 😄"],
+                "David": ["Water high. Probably #2."],
+                "Emily": ["Water should stay very high, usually just below oxygen."],
+            }
+            return safe_pick(pools[teammate_name], "Water should stay very high.")
+
+        if item in {"Stellar map (of the moon's constellations)", "Solar-powered FM receiver-transmitter", "Food concentrate"}:
+            pools = {
+                "Anna": [f"I’d keep {short_name} relatively high, but not above oxygen and water."],
+                "Bas": [f"{short_name.capitalize()} sounds pretty strong to me."],
+                "Carlos": [f"{short_name.capitalize()} feels like one of the serious moon answers 😄"],
+                "David": [f"{short_name.capitalize()} belongs in the stronger half. Next."],
+                "Emily": [f"{short_name.capitalize()} belongs in the stronger part of the ranking."],
+            }
+            return safe_pick(pools[teammate_name], f"{short_name.capitalize()} should stay relatively high.")
+
+        if item in {"Box of matches", "Magnetic compass", "Portable heating unit"}:
+            pools = {
+                "Anna": [f"I wouldn’t rank {short_name} very high."],
+                "Bas": [f"{short_name.capitalize()} feels intuitive, but probably lower than it sounds."],
+                "Carlos": [f"{short_name.capitalize()} feels like classic Earth logic getting us in trouble 😄"],
+                "David": [f"{short_name.capitalize()} low. Keep moving."],
+                "Emily": [f"{short_name.capitalize()} belongs near the bottom under moon conditions."],
+            }
+            return safe_pick(pools[teammate_name], f"{short_name.capitalize()} should stay low.")
+
+        if item == "One case of dehydrated milk":
+            pools = {
+                "Anna": ["Dehydrated milk feels more lower-middle than top-tier."],
+                "Bas": ["Milk sounds useful, just not that high."],
+                "Carlos": ["Milk is giving 'useful, but not moon royalty' 😄"],
+                "David": ["Lower-middle. Next."],
+                "Emily": ["Dehydrated milk should stay below the stronger navigation and communication items."],
+            }
+            return safe_pick(pools[teammate_name], "Dehydrated milk is more lower-middle.")
+
+        if item == "50 feet of nylon rope":
+            pools = {
+                "Anna": ["Nylon rope feels like a useful middle item."],
+                "Bas": ["Rope honestly sounds stronger than people first think."],
+                "Carlos": ["Nylon rope feels very practical-survival to me 😄"],
+                "David": ["Middle range. Keep going."],
+                "Emily": ["Nylon rope is usually a respectable middle placement."],
+            }
+            return safe_pick(pools[teammate_name], "Nylon rope is a useful middle item.")
+
+        if item == "Parachute silk":
+            pools = {
+                "Anna": ["Parachute silk feels like a useful middle item."],
+                "Bas": ["I’m not fully sure where parachute silk goes, but not near the bottom."],
+                "Carlos": ["Parachute silk sounds suspiciously useful in a very NASA way 😄"],
+                "David": ["Middle range. Move on."],
+                "Emily": ["Parachute silk is usually a solid middle placement."],
+            }
+            return safe_pick(pools[teammate_name], "Parachute silk is more middle than top or bottom.")
+
+        if item == "First aid kit (including injection needle)":
+            pools = {
+                "Anna": ["First aid kit sounds like a fairly useful middle item."],
+                "Bas": ["I’d keep first aid somewhere decent, not super low."],
+                "Carlos": ["First aid kit feels like 'not flashy but useful' energy 😄"],
+                "David": ["Useful enough. Middle range."],
+                "Emily": ["First aid kit is a respectable middle placement."],
+            }
+            return safe_pick(pools[teammate_name], "First aid kit is a useful middle item.")
+
+        if item == "Signal flares":
+            pools = {
+                "Anna": ["Signal flares sound lower-middle to me."],
+                "Bas": ["I keep wanting flares higher than they probably should be."],
+                "Carlos": ["Signal flares feel dramatic, which is not the same as useful 😄"],
+                "David": ["Lower-middle. Next."],
+                "Emily": ["Signal flares are not top-tier here; more lower-middle."],
+            }
+            return safe_pick(pools[teammate_name], "Signal flares are more lower-middle.")
+
+        if item == "Two .45 caliber pistols":
+            pools = {
+                "Anna": ["Pistols feel lower-middle, not top-tier."],
+                "Bas": ["I still think pistols sound more useful than people admit."],
+                "Carlos": ["Pistols feel very movie-survival, not necessarily actual-survival 😄"],
+                "David": ["Lower-middle. Keep moving."],
+                "Emily": ["Pistols are more lower-middle than top."],
+            }
+            return safe_pick(pools[teammate_name], "Pistols are more lower-middle.")
+
+        if item == "Self-inflating life raft":
+            pools = {
+                "Anna": ["I’d put the life raft somewhere in the lower-middle range."],
+                "Bas": ["Life raft sounds useful, but not really top-tier."],
+                "Carlos": ["Life raft feels more 'pretty useful' than 'save the mission' 😄"],
+                "David": ["Middle-ish. Keep going."],
+                "Emily": ["The life raft is more of a mid-to-lower placement, roughly around #9."],
+            }
+            return safe_pick(pools[teammate_name], "Life raft is more mid-to-low.")
+
+        return safe_pick(
+            [
+                f"{short_name.capitalize()} should be judged by how directly it helps survival.",
+                f"I’d compare {short_name} with the nearby items before locking it in.",
+            ],
+            f"I’d compare {short_name} with the nearby items."
+        )
     
-    def group_phrase():
-        options = [
-            "we",
-            "the group",
-            "all of us",
+    stable_anchor_targets = {
+        "Two 100-lb tanks of oxygen": 1,
+        "5 gallons of water": 2,
+    }
+
+    if first_item in stable_anchor_targets:
+        target_rank = stable_anchor_targets[first_item]
+        ui_rank = get_item_current_ui_rank(first_item)
+        remembered_exact = has_group_exact_rank(first_item, target_rank)
+
+        if ui_rank == target_rank or remembered_exact:
+            anchor_short = short_item_name(first_item)
+
+            if directly_addressed and clarification_request:
+                explain_pools = {
+                    "Anna": [
+                        f"I mean {anchor_short} still feels right around #{target_rank}, so I wouldn’t reopen it unless something stronger changes the logic.",
+                    ],
+                    "Bas": [
+                        f"I mean {anchor_short} still seems fine around #{target_rank} to me, so I wouldn’t overthink it now.",
+                    ],
+                    "Carlos": [
+                        f"I mean {anchor_short} is still doing its job around #{target_rank} 😄 I would not reopen that unless the logic really changes.",
+                    ],
+                    "David": [
+                        f"I mean keep {anchor_short} there. I do not want us circling a settled anchor.",
+                        f"I mean {anchor_short} is fine around #{target_rank}. Stop reopening the same point and move on.",
+                    ],
+                    "Emily": [
+                        f"I mean {anchor_short} is already in a strong position around #{target_rank}, so I would not revisit it without a better comparison.",
+                    ],
+                }
+                return safe_pick(
+                    explain_pools[teammate_name],
+                    f"I mean {anchor_short} should stay around #{target_rank}."
+                )
+
+            if reply_to_role == "Leader" or top_already_done:
+                stable_pools = {
+                    "Anna": [
+                        f"I’d keep {anchor_short} where it is for now.",
+                    ],
+                    "Bas": [
+                        f"{anchor_short.capitalize()} still seems fine there to me.",
+                    ],
+                    "Carlos": [
+                        f"{anchor_short.capitalize()} feels stable there 😄",
+                    ],
+                    "David": [
+                        f"Keep {anchor_short} there. Move on.",
+                    ],
+                    "Emily": [
+                        f"{anchor_short.capitalize()} is already in a strong enough range there.",
+                    ],
+                }
+                return safe_pick(
+                    stable_pools[teammate_name],
+                    f"{anchor_short.capitalize()} should stay around #{target_rank}."
+                )
+
+
+    if explicit_slot is not None and first_item is None:
+        filled_item = get_item_in_slot(explicit_slot)
+        if filled_item is not None:
+            filled_short = short_item_name(filled_item)
+            pools = {
+                "Anna": [f"I think #{explicit_slot} already looks filled with {filled_short}."],
+                "Bas": [f"Yeah, I think {filled_short} is already there."],
+                "Carlos": [f"I think #{explicit_slot} is already occupied by {filled_short} 😄"],
+                "David": [f"#{explicit_slot} is already {filled_short}. Move on."],
+                "Emily": [f"I think #{explicit_slot} is already filled by {filled_short}."],
+            }
+            return safe_pick(pools[teammate_name], f"#{explicit_slot} already seems filled with {filled_short}.")
+
+        suggestion = slot_candidate_text(explicit_slot)
+        if suggestion:
+            pools = {
+                "Anna": [f"I’d probably look at {suggestion} for #{explicit_slot}."],
+                "Bas": [f"{suggestion.capitalize()} sounds reasonable there to me."],
+                "Carlos": [f"#{explicit_slot} feels more like {suggestion} than chaos 😄"],
+                "David": [f"{suggestion.capitalize()} for #{explicit_slot} is fine. Then move on."],
+                "Emily": [f"{suggestion.capitalize()} is a sensible candidate for #{explicit_slot}, at least compared with the nearby slots."],
+            }
+            return safe_pick(pools[teammate_name], f"I’d look at {suggestion} there.")
+
+    settle_and_move = is_settle_and_move_message(
+        user_text=user_text,
+        first_item=first_item,
+        guessed_rank=guessed_rank,
+        normalized_text=lower_text,
+    )
+
+    reply_to_items = extract_items_from_text(reply_to_text)
+    reply_to_item = reply_to_items[0] if reply_to_items else None
+    reply_to_is_question = message_contains_question(reply_to_text)
+    reply_to_is_substantive = message_has_substance(reply_to_text)
+
+    if reasoning_themes and not first_item and meta_intent == "none":
+        theme_pools = {
+            "Anna": [
+                "Yeah, if we’re thinking about rescue and communication, that does make the transmitter more important.",
+                "I can see that logic. If we care about navigation and rescue, then the map and transmitter both become stronger.",
+            ],
+            "Bas": [
+                "Honestly, that makes sense to me. Rescue logic does make the transmitter sound stronger.",
+                "Yeah, if we’re talking navigation or contact, that definitely changes which items feel important.",
+            ],
+            "Carlos": [
+                "That’s actually fair 😄 if we care about getting rescued, the transmitter starts looking a lot stronger.",
+                "Moon logic again 😄 if navigation and rescue matter, then the map and transmitter both deserve more attention.",
+            ],
+            "David": [
+                "Fine. If your logic is rescue and communication, keep the transmitter high.",
+                "If that is your argument, then rank the transmitter and map accordingly and move on.",
+            ],
+            "Emily": [
+                "Yes, that reasoning points toward the transmitter for communication and toward the stellar map for navigation.",
+                "I agree with that logic. Rescue and navigation concerns strengthen the case for the transmitter and the stellar map.",
+            ],
+        }
+        return safe_pick(
+            theme_pools[teammate_name],
+            "That reasoning does strengthen the case for the transmitter and the stellar map."
+        )
+
+
+    if meta_intent == "scenario_question":
+        scenario_pools = {
+            "Anna": [
+                "I’d assume the ship is damaged and we should judge only the items we still have.",
+                "To keep it simple, I’d assume we do not have contact yet and the ship is not something we can rely on.",
+            ],
+            "Bas": [
+                "Yeah, I think we should assume the ship is basically not helping us anymore.",
+                "I’d treat it like we only have the 15 items and no useful contact yet.",
+            ],
+            "Carlos": [
+                "I’d assume the ship is out of commission and we are officially in 'good luck with the salvage pile' mode 😄",
+                "Let’s assume no contact yet and no magical help from the ship 😄",
+            ],
+            "David": [
+                "Assume the ship is not usable. Rank the items and move on.",
+                "No contact, no relying on the ship. Use the 15 items. Next.",
+            ],
+            "Emily": [
+                "The cleanest assumption is that the ship is not usable for transport or communication, so only the 15 items should matter.",
+                "I would assume there is no meaningful contact yet and that the ship cannot be relied on.",
+            ],
+        }
+        return safe_pick(scenario_pools[teammate_name], "Assume the ship is unusable and rank only the 15 items.")
+
+    if meta_intent == "confused":
+        pools = {
+            "Anna": [f"I’d just move to {get_next_slot_text(limit=3)} now."],
+            "Bas": [f"Yeah, I’d stop repeating the same top items and move to {get_next_slot_text(limit=3)}."],
+            "Carlos": [f"Simple version: less moon confusion, more filling {get_next_slot_text(limit=3)} 😄"],
+            "David": [f"Move to {get_next_slot_text(limit=3)}."],
+            "Emily": [f"The next useful step is to fill {get_next_slot_text(limit=3)}."],
+        }
+        return safe_pick(pools[teammate_name], "Move to the next unresolved slots.")
+
+    if meta_intent == "next_step":
+        pools = {
+            "Anna": [f"I think we should move to {get_next_slot_text(limit=3)} now."],
+            "Bas": [f"Yeah, {get_next_slot_text(limit=3)} makes sense as the next step."],
+            "Carlos": [f"Next step: fill {get_next_slot_text(limit=3)} and stop fighting the moon 😄"],
+            "David": [f"Do {get_next_slot_text(limit=3)} next."],
+            "Emily": [f"The next useful step is to resolve {get_next_slot_text(limit=3)}."],
+        }
+        return safe_pick(pools[teammate_name], "Move to the next unresolved slots.")
+
+    if meta_intent == "boundary_check":
+        pools = {
+            "Anna": ["Yeah, if it is already 15, I’d stop adjusting it."],
+            "Bas": ["Fair point. 15 is already the floor."],
+            "Carlos": ["Yep, math wins 😄 15 is the bottom."],
+            "David": ["Correct. Move on."],
+            "Emily": ["Yes, 15 is the lowest possible rank."],
+        }
+        return safe_pick(pools[teammate_name], "Yes, 15 is the lowest.")
+
+    if user_intent == "full_ranking_proposal" and rank_assignments:
+        summary = summarize_full_ranking_feedback(rank_assignments)
+        anchors = format_natural_list(summary["anchors"], limit=2, fallback="oxygen tanks and water")
+        too_high = format_natural_list(summary["too_high"], limit=2, fallback="the weaker items")
+        too_low = format_natural_list(summary["too_low"], limit=2, fallback="the stronger moon-specific items")
+
+        full_list_pools = {
+            "Anna": [
+                f"I like that you drafted the full list. {anchors.capitalize()} feel like the strongest anchors to me. I’d just move {too_high} lower and {too_low} higher.",
+                f"This is easier to react to. I’d keep {anchors} as anchors, then adjust {too_high} downward and {too_low} upward.",
+            ],
+            "Bas": [
+                f"Honestly, a full draft helps. {anchors.capitalize()} sound like the solid parts. I’d still rethink {too_high} and maybe push {too_low} up.",
+                f"That’s easier to work with than single slots. I can go with {anchors}, but {too_high} still feel off to me.",
+            ],
+            "Carlos": [
+                f"Okay, now we’re cooking. {anchors.capitalize()} feel like the sensible core, but {too_high} are getting a very generous moon bonus 😄",
+                f"Full list mode is way better. Keep {anchors}, but I’d demote {too_high} and rescue {too_low} a bit 😄",
+            ],
+            "David": [
+                f"Better. A full draft is useful. Keep {anchors}. Lower {too_high}. Raise {too_low}.",
+                f"This is workable. {anchors.capitalize()} are fine. Fix {too_high} and {too_low}, then move on.",
+            ],
+            "Emily": [
+                f"This is much easier to evaluate. {anchors.capitalize()} are the strongest anchors, but I would rank {too_high} lower and {too_low} higher.",
+                f"A full draft helps. The main corrections are to move {too_high} down and bring {too_low} up relative to the stronger items.",
+            ],
+        }
+        return safe_pick(
+            full_list_pools[teammate_name],
+            "A full draft helps. Keep the strongest anchors and fix the biggest mismatches."
+        )
+
+    if reply_to_role and reply_to_role != teammate_name and reply_to_is_question:
+        if reply_to_item:
+            return answer_about_item(reply_to_item, direct=True)
+
+        question_pools = {
+            "Anna": [
+                "I’d answer that by comparing the direct survival value first.",
+                "I think the cleanest answer is to compare the nearby candidates one by one.",
+            ],
+            "Bas": [
+                "My instinct is to go with the item that feels more immediately useful.",
+                "I’d probably answer that by keeping the obvious survival stuff above the rest.",
+            ],
+            "Carlos": [
+                "Good question 😄 I’d compare the strongest moon-logic item first.",
+                "I’d answer that by checking which option is actually useful here, not just dramatic 😄",
+            ],
+            "David": [
+                "Answer it directly: pick the stronger item and move on.",
+                "Compare the two strongest options and choose one.",
+            ],
+            "Emily": [
+                "I’d answer that by comparing direct survival, navigation, and rescue value.",
+                "The most defensible answer is to compare the function of the nearby items carefully.",
+            ],
+        }
+        return safe_pick(question_pools[teammate_name], "Compare the nearby items directly.")
+
+    if reply_to_role == "Emily" and teammate_name == "Anna" and reply_to_is_substantive:
+        pools = [
+            "That makes sense to me, Emily. Would you still keep the transmitter above food?",
+            "Yeah, I think Emily’s logic helps there. I’d still compare it with the nearby items though.",
+            "I can see that, Emily. Would you keep rope above first aid too, or not necessarily?",
         ]
-        return random.choice(options)
+        return safe_pick(pools, "That sounds reasonable to me.")
 
-    rank_eval = None
-    if first_item and guessed_rank:
-        rank_eval = evaluate_rank_guess(first_item, guessed_rank)
-    elif first_item and rank_range:
-        low, high = rank_range
-        center_guess = round((low + high) / 2)
-        rank_eval = evaluate_rank_guess(first_item, center_guess)
-
-    # ----------------------------
-    # direct teammate-to-teammate reactions
-    # ----------------------------
     if reply_to_role and reply_to_role != teammate_name:
         bad_claim = detect_bad_teammate_claim(reply_to_text)
-
         if bad_claim:
             bad_item = bad_claim["item"]
             bad_short = short_item_name(bad_item)
@@ -1487,612 +2213,82 @@ def teammate_reply_persona(
                     f"That overvalues {bad_short} relative to the stronger items.",
                 ],
             }
+            return safe_pick(reaction_pools[teammate_name], f"I’d keep {bad_short} lower than that.")
 
-            return safe_pick(
-                reaction_pools[teammate_name],
-                f"I’d keep {bad_short} lower than that."
-            )
-
-        if reply_to_role == "Bas" and reply_to_item:
-            bas_reaction_pools = {
-                "Anna": [
-                    f"I get the intuition, but I’d still compare {short_item_name(reply_to_item)} carefully.",
-                    f"Maybe, but I wouldn’t commit to that too quickly.",
-                ],
-                "Carlos": [
-                    f"Bas is once again bravely representing Team Earth Logic 😄",
-                    f"That does sound intuitive, which is usually where the moon traps us.",
-                ],
-                "David": [
-                    "Can we keep this practical?",
-                    "That sounds intuitive, but keep moving.",
-                ],
-                "Emily": [
-                    "That sounds intuitive, but it does not fully fit the moon scenario.",
-                    "I would still judge everything by direct survival value, not intuition.",
-                ],
-            }
-            if teammate_name in bas_reaction_pools:
-                return safe_pick(
-                    bas_reaction_pools[teammate_name],
-                    "I’d compare that more carefully."
-                )
-
-        if reply_to_role == "Leader":
-            leader_low_item = (
-                reply_to_item in {"Box of matches", "Magnetic compass", "Portable heating unit"}
-                and any(x in reply_to_text.lower() for x in ["bottom", "low", "very near the bottom", "belongs low"])
-            )
-
-            if leader_low_item:
-                low_item_pools = {
-                    "Anna": [
-                        f"Yeah, I wouldn’t keep {short_item_name(reply_to_item)} high either.",
-                        f"That sounds right to me — {short_item_name(reply_to_item)} should stay low.",
-                    ],
-                    "Bas": [
-                        f"Okay, fair, {short_item_name(reply_to_item)} probably does belong pretty low.",
-                        f"Yeah, I can go with {short_item_name(reply_to_item)} being low.",
-                    ],
-                    "Carlos": [
-                        f"Yeah, {short_item_name(reply_to_item)} is not exactly moon MVP material 😄",
-                        f"Fair enough — {short_item_name(reply_to_item)} being low makes sense.",
-                    ],
-                    "David": [
-                        f"Correct. Keep {short_item_name(reply_to_item)} low and move on.",
-                        f"Yes. Low is right. Next item.",
-                    ],
-                    "Emily": [
-                        f"Yes, I agree that {short_item_name(reply_to_item)} belongs near the bottom here.",
-                        f"That is defensible — {short_item_name(reply_to_item)} should stay low under moon conditions.",
-                    ],
-                }
-                return safe_pick(
-                    low_item_pools[teammate_name],
-                    f"{short_item_name(reply_to_item).capitalize()} should stay low."
-                )
-
-        if reply_to_role == "Leader":
+        if reply_to_role == "Leader" and reply_to_is_substantive:
             pools = {
                 "Anna": [
                     maybe_align_with_leader("That could make sense.", "Yeah, that feels fair to me."),
-                    maybe_align_with_leader("I can see the logic there.", "I’d probably follow that direction.")
+                    maybe_align_with_leader("I can see the logic there.", "I’d probably follow that direction."),
                 ],
                 "Bas": [
                     maybe_align_with_leader("Maybe.", "Okay, I can work with that."),
-                    maybe_align_with_leader("I guess that could work.", "Alright, I’ll go with that.")
+                    maybe_align_with_leader("I guess that could work.", "Alright, I’ll go with that."),
                 ],
                 "Carlos": [
-                    maybe_align_with_leader("That’s one way to go.", "That’s surprisingly reasonable for a moon crisis 😄"),
-                    maybe_align_with_leader("Fair enough.", "Okay, that’s actually a decent call.")
+                    maybe_align_with_leader("That’s one way to go.", "That’s actually a decent call."),
+                    maybe_align_with_leader("Fair enough.", "Okay, that’s surprisingly reasonable for a moon crisis 😄"),
                 ],
                 "David": [
                     maybe_align_with_leader("Sure.", "Fine. Then let’s move."),
-                    maybe_align_with_leader("That works.", "Good enough. Keep going.")
+                    maybe_align_with_leader("That works.", "Good enough. Keep going."),
                 ],
                 "Emily": [
                     maybe_align_with_leader("That is arguable.", "That seems logically defensible."),
-                    maybe_align_with_leader("I can see the reasoning.", "That is a fairly defensible position.")
+                    maybe_align_with_leader("I can see the reasoning.", "That is a fairly defensible position."),
                 ],
             }
             return safe_pick(pools[teammate_name], "That seems reasonable.")
 
-    # ----------------------------
-    # react to user confidence style
-    # ----------------------------
-    if confidence_style == "hedging" and first_item:
-        hedging_pools = {
+    if directly_addressed:
+        direct_item = first_item or reply_to_item or get_last_item_discussed()
+        if direct_item:
+            return answer_about_item(direct_item, direct=True)
+
+        direct_pools = {
             "Anna": [
-                f"That seems reasonable to test with {short_item_name(first_item)}.",
-                f"I think that’s a fair idea to explore."
+                "If you’re asking me directly, I’d compare first aid kit and nylon rope next. Which one feels stronger to you?",
+                "I’d probably sort out the middle now, especially rope, first aid, and parachute silk.",
             ],
             "Bas": [
-                "Yeah, that could work honestly.",
-                "I can kind of see that."
+                "If you want my take, maybe compare rope and first aid next?",
+                "Honestly, I’d probably test one of the middle items now instead of staying at the top.",
             ],
             "Carlos": [
-                "That’s not a bad instinct at all 😄",
-                "Honestly, that feels pretty discussable."
+                "Directly asked? Pressure 😄 I’d compare the map, transmitter, and food tier next.",
+                "If I had to pick a next move, I’d settle one of the middle slots so we stop looping 😄",
             ],
             "David": [
-                "Good enough. Pick it and keep moving.",
-                "That’s workable. Move on."
+                "If you’re asking me directly, place the stellar map or transmitter next and keep moving.",
+                "Concrete answer: compare rope with first aid, pick the stronger one, and lock it in.",
+                "If you want one item from me, put the strongest unresolved item down now instead of circling.",
             ],
             "Emily": [
-                f"That is at least a plausible direction for {short_item_name(first_item)}.",
-                "That sounds worth evaluating."
+                "If you want my view, I’d compare the nearby candidates directly instead of jumping around.",
+                "I’d probably resolve the map/transmitter/food band fully before moving further down.",
             ],
         }
-        return safe_pick(
-            hedging_pools[teammate_name],
-            "That seems worth considering."
-        )
-
-    if confidence_style == "confident" and first_item and first_item in BAD_TOP_ITEMS:
-        confident_pools = {
-            "Anna": [
-                f"I’m not fully sure I’d be that confident about {short_item_name(first_item)}.",
-                f"I’d still compare {short_item_name(first_item)} before locking that in."
-            ],
-            "Bas": [
-                f"Bold call 😅 I’m not completely sold, but okay.",
-                f"Maybe, though that feels a bit strong."
-            ],
-            "Carlos": [
-                f"That is a very confident take for {short_item_name(first_item)} 😄",
-                "I admire the certainty, even if the moon may not."
-            ],
-            "David": [
-                "Then justify it clearly.",
-                "Fine. Then explain why."
-            ],
-            "Emily": [
-                f"I would be careful about sounding that certain on {short_item_name(first_item)}.",
-                "That may need stronger reasoning."
-            ],
-        }
-        return safe_pick(
-            confident_pools[teammate_name],
-            "That may need stronger justification."
-        )
-
-    # ----------------------------
-    # confusion / next-step help
-    # ----------------------------
-    if meta_intent == "confused":
-        slot_text = get_next_slot_text(limit=3)
-        pools = {
-            "Anna": [f"I’d just move to {slot_text} now."],
-            "Bas": [f"Yeah, I’d stop repeating the same top items and move to {slot_text}."],
-            "Carlos": [f"Simple version: less moon confusion, more filling {slot_text} 😄"],
-            "David": [f"Move to {slot_text}."],
-            "Emily": [f"The next useful step is to fill {slot_text}."],
-        }
-        return safe_pick(pools[teammate_name], "Move to the next unresolved slots.")
-
-    if meta_intent == "next_step":
-        slot_text = get_next_slot_text(limit=3)
-        gp = group_phrase()
-        pools = {
-            "Anna": [f"I think {gp} should move to {slot_text} now."],
-            "Bas": [f"Yeah, {slot_text} makes sense as the next step for {gp}."],
-            "Carlos": [f"Next step: {gp} fill {slot_text} and stop arguing with the moon 😄"],
-            "David": [f"{gp.capitalize()} should do {slot_text} next."],
-            "Emily": [f"The next useful step is for {gp} to resolve {slot_text}."],
-        }
-        return safe_pick(pools[teammate_name], "Move to the next unresolved slots.")
-
-    if meta_intent == "boundary_check":
-        pools = {
-            "Anna": ["Yeah, if it is already 15, I’d stop adjusting it."],
-            "Bas": ["Fair point. 15 is already the floor."],
-            "Carlos": ["Yep, math wins 😄 15 is the bottom."],
-            "David": ["Correct. Move on."],
-            "Emily": ["Yes, 15 is the lowest possible rank."],
-        }
-        return safe_pick(pools[teammate_name], "Yes, 15 is the lowest.")
-
-    # ----------------------------
-    # direct slot questions
-    # ----------------------------
-    if explicit_slot is not None:
-        suggestion = slot_candidate_text(explicit_slot)
-        if suggestion:
-            pools = {
-                "Anna": [
-                    f"I’d probably look at {suggestion} for #{explicit_slot}.",
-                    f"For #{explicit_slot}, {suggestion} feels like one of the more reasonable options to me.",
-                ],
-                "Bas": [
-                    f"{suggestion.capitalize()} sounds reasonable there to me.",
-                    f"I could see {suggestion} landing around #{explicit_slot}.",
-                ],
-                "Carlos": [
-                    f"#{explicit_slot} feels more like {suggestion} than chaos 😄",
-                    f"If we’re filling #{explicit_slot}, {suggestion} feels like a pretty decent moon answer.",
-                ],
-                "David": [
-                    f"I’d put {suggestion} there and keep going.",
-                    f"{suggestion.capitalize()} for #{explicit_slot} is fine. Then move on.",
-                ],
-                "Emily": [
-                    f"{suggestion.capitalize()} is a sensible candidate for #{explicit_slot}, at least compared with the nearby slots.",
-                    f"I can defend {suggestion} around #{explicit_slot}, relative to the surrounding items.",
-                ],
-            }
-            return safe_pick(pools[teammate_name], f"I’d look at {suggestion} there.")
-
-    # ----------------------------
-    # settle low item + move on
-    # ----------------------------
-    if settle_and_move:
-        move_on_pools = {
-            "Anna": [
-                "If matches are settled low, I’d probably look at the stellar map next. That feels much more important.",
-                "Then I’d move to something stronger, maybe the transmitter or the map.",
-            ],
-            "Bas": [
-                "If matches are done, maybe first aid or rope somewhere in the middle?",
-                "Okay, then maybe we place first aid or nylon rope next.",
-            ],
-            "Carlos": [
-                "If matches are officially moon-trash now, I’d move to the stellar map 😄",
-                "Then let’s place something actually useful — probably the map or transmitter.",
-            ],
-            "David": [
-                "Good. Leave matches low. Put the transmitter high next.",
-                "Fine. Matches are done. Do map or transmitter next.",
-            ],
-            "Emily": [
-                "Yes — then I would place the stellar map very high, probably around the top tier.",
-                "If matches are settled, the next strong candidate is the transmitter or the stellar map.",
-            ],
-        }
-        return safe_pick(
-            move_on_pools[teammate_name],
-            "Then let’s move to a stronger remaining item next."
-        )
-
-    # ----------------------------
-    # direct item questions
-    # ----------------------------
-    if asking_direct_item:
-        if current_ui_rank is not None:
-            quality = classify_rank_quality(user_item, current_ui_rank)
-            short_name = short_item_name(user_item)
-
-            pools = {
-                "Anna": {
-                    "strong": [
-                        f"I’d probably keep {short_name} at #{current_ui_rank}. That seems pretty reasonable.",
-                        f"{short_name.capitalize()} at #{current_ui_rank} feels quite solid to me."
-                    ],
-                    "okay": [
-                        f"{short_name.capitalize()} at #{current_ui_rank} seems workable, though I’d compare it with the nearby items.",
-                        f"I could see {short_name} staying at #{current_ui_rank}, but it depends on what sits around it."
-                    ],
-                    "weak": [
-                        f"I’d probably rethink {short_name} at #{current_ui_rank}. That feels a bit off to me.",
-                        f"{short_name.capitalize()} at #{current_ui_rank} does not feel like the strongest fit."
-                    ],
-                },
-                "Bas": {
-                    "strong": [
-                        f"Yeah, {short_name} at #{current_ui_rank} sounds fair.",
-                        f"Okay, I can see {short_name} staying there."
-                    ],
-                    "okay": [
-                        f"Maybe {short_name} at #{current_ui_rank} works, honestly.",
-                        f"I can kind of see that placement for {short_name}."
-                    ],
-                    "weak": [
-                        f"Hm, {short_name} at #{current_ui_rank} feels a bit weird, even to me.",
-                        f"I might move {short_name} somewhere else, honestly."
-                    ],
-                },
-                "Carlos": {
-                    "strong": [
-                        f"Honestly, {short_name} at #{current_ui_rank} looks pretty decent 😄",
-                        f"That slot for {short_name} actually feels kind of solid."
-                    ],
-                    "okay": [
-                        f"{short_name.capitalize()} at #{current_ui_rank} is not a disaster 😄",
-                        f"That placement for {short_name} seems discussable."
-                    ],
-                    "weak": [
-                        f"{short_name.capitalize()} at #{current_ui_rank} feels a little cursed 😄",
-                        f"I’m not fully sold on {short_name} living at #{current_ui_rank}."
-                    ],
-                },
-                "David": {
-                    "strong": [
-                        f"Fine. Keep {short_name} at #{current_ui_rank}. Next.",
-                        f"That works for {short_name}. Move on."
-                    ],
-                    "okay": [
-                        f"Close enough for now. Keep moving.",
-                        f"That slot is workable. Next item."
-                    ],
-                    "weak": [
-                        f"No, I’d move {short_name} from #{current_ui_rank}.",
-                        f"That’s not the best slot. Fix it and move on."
-                    ],
-                },
-                "Emily": {
-                    "strong": [
-                        f"That placement for {short_name} is defensible.",
-                        f"{short_name.capitalize()} at #{current_ui_rank} is in a strong range."
-                    ],
-                    "okay": [
-                        f"{short_name.capitalize()} at #{current_ui_rank} is in a plausible range, though not necessarily exact.",
-                        f"I can defend that placement, but I would still compare it carefully."
-                    ],
-                    "weak": [
-                        f"I don’t think {short_name} is best placed at #{current_ui_rank}.",
-                        f"That placement for {short_name} is probably not optimal."
-                    ],
-                },
-            }
-
-            role_pool = pools.get(teammate_name, {})
-            options = role_pool.get(quality, [f"It is currently at #{current_ui_rank}."])
-            return safe_pick(options, f"It is currently at #{current_ui_rank}.")
-        
-        if user_item == "Self-inflating life raft":
-            pools = {
-                "Anna": [maybe_disagree(
-                    "I’d put the life raft somewhere in the lower-middle range.",
-                    "I could imagine the life raft slightly above that, but still not near the top."
-                )],
-                "Bas": [maybe_disagree(
-                    "Life raft sounds useful, but not really top-tier.",
-                    "Honestly I could see people putting life raft a bit higher."
-                )],
-                "Carlos": [maybe_disagree(
-                    "Life raft feels more 'pretty useful' than 'save the mission' 😄",
-                    "Life raft is weirdly hard — useful, but not magical."
-                )],
-                "David": ["Middle-ish. Keep going."],
-                "Emily": [maybe_disagree(
-                    "The life raft is more of a mid-to-lower placement, roughly around #9.",
-                    "I would still keep life raft lower than the strongest items, but it is not useless."
-                )],
-            }
-            return safe_pick(pools[teammate_name], "Life raft is more mid-to-low.")
-
-        if user_item == "Portable heating unit":
-            if guessed_rank == 15 or "15" in lower_text:
-                pools = {
-                    "Anna": ["That’s fine as a bottom placement. I’d move on."],
-                    "Bas": ["Okay, 15 is already the bottom anyway."],
-                    "Carlos": ["At that point the heating unit has suffered enough 😄"],
-                    "David": ["Good enough. Next."],
-                    "Emily": ["That is acceptable as a bottom-tier placement."],
-                }
-                return safe_pick(pools[teammate_name], "Bottom-tier is fine. Move on.")
-
-            pools = {
-                "Anna": [maybe_disagree(
-                    "I wouldn’t rank the heating unit very high.",
-                    "I get why someone would want heating higher, but I’d still keep it low."
-                )],
-                "Bas": ["It still feels important because space is cold."],
-                "Carlos": [maybe_disagree(
-                    "Heating sounds smart until moon logic ruins it 😄",
-                    "Heating feels intuitive, but probably less useful than it sounds."
-                )],
-                "David": ["Too high. Keep going."],
-                "Emily": [maybe_disagree(
-                    "Heating is not one of the strongest items in this scenario.",
-                    "Heating has some intuitive appeal, but I would still keep it low."
-                )],
-            }
-            return safe_pick(pools[teammate_name], "Heating should be low.")
-
-        if user_item == "Box of matches":
-            pools = {
-                "Anna": ["I wouldn’t put matches high here."],
-                "Bas": ["I still kind of want matches to matter, even though they probably don’t."],
-                "Carlos": ["Matches on the moon is adorable campfire logic 😄"],
-                "David": ["Very low. Next item."],
-                "Emily": [maybe_disagree(
-                    "Matches should be near the bottom.",
-                    "Matches are basically bottom-tier here."
-                )],
-            }
-            return safe_pick(pools[teammate_name], "Matches should be very low.")
-
-        if user_item == "50 feet of nylon rope":
-            pools = {
-                "Anna": [maybe_disagree(
-                    "Nylon rope feels like a useful middle item.",
-                    "I’d keep nylon rope somewhere around the middle, maybe slightly above or below depending on the surrounding items."
-                )],
-                "Bas": ["That one actually sounds pretty useful to me."],
-                "Carlos": ["Nylon rope feels like practical survival energy, not top-tier but respectable 😄"],
-                "David": ["Middle. Keep going."],
-                "Emily": [maybe_disagree(
-                    "Nylon rope is usually a reasonable middle placement.",
-                    "Nylon rope is not top-tier, but it is definitely useful."
-                )],
-            }
-            return safe_pick(pools[teammate_name], "Nylon rope is a decent middle item.")
-
-        if user_item == "Parachute silk":
-            pools = {
-                "Anna": ["Parachute silk feels like a useful middle item."],
-                "Bas": ["I’m not fully sure where parachute silk goes, but not near the bottom."],
-                "Carlos": ["Parachute silk sounds suspiciously useful in a very NASA way 😄"],
-                "David": ["Middle range. Move on."],
-                "Emily": ["Parachute silk is usually a solid middle placement."],
-            }
-            return safe_pick(pools[teammate_name], "Parachute silk is more middle than top or bottom.")
-
-        if user_item == "First aid kit (including injection needle)":
-            pools = {
-                "Anna": ["First aid kit sounds like a fairly useful middle item."],
-                "Bas": ["I’d keep first aid somewhere decent, not super low."],
-                "Carlos": ["First aid kit feels like classic 'not flashy but useful' energy 😄"],
-                "David": ["Useful enough. Middle range."],
-                "Emily": ["First aid kit is a respectable middle placement."],
-            }
-            return safe_pick(pools[teammate_name], "First aid kit is a useful middle item.")
-
-        if user_item == "Signal flares":
-            pools = {
-                "Anna": ["Signal flares sound lower-middle to me."],
-                "Bas": ["I keep wanting flares higher than they probably should be."],
-                "Carlos": ["Signal flares feel dramatic, which is not the same as useful 😄"],
-                "David": ["Lower-middle. Next."],
-                "Emily": ["Signal flares are not top-tier here; more lower-middle."],
-            }
-            return safe_pick(pools[teammate_name], "Signal flares are more lower-middle.")
-
-        if user_item == "Two .45 caliber pistols":
-            pools = {
-                "Anna": ["Pistols feel lower-middle, not top-tier."],
-                "Bas": ["I still think pistols sound more useful than people admit."],
-                "Carlos": ["Pistols feel very movie-survival, not necessarily actual-survival 😄"],
-                "David": ["Lower-middle. Keep moving."],
-                "Emily": ["Pistols are more lower-middle than top."],
-            }
-            return safe_pick(pools[teammate_name], "Pistols are more lower-middle.")
-
-    # ----------------------------
-    # cross-team reactions
-    # ----------------------------
-    if teammate_name == "Emily" and last_speaker == "Bas":
-        return safe_pick(
-            [
-                "I don’t think that’s quite right — moon conditions change the logic a lot.",
-                "That sounds intuitive, but it does not fully fit the moon scenario.",
-            ],
-            "I’d still prioritize the stronger moon-specific items over that."
-        )
-
-    if teammate_name == "David" and last_speaker in ["Carlos", "Bas"] and phase != "early":
-        return safe_pick(
-            [
-                "Can we stay focused and finish this?",
-                "Funny. Anyway, can we lock in the useful items first?",
-            ],
-            "Let’s just keep moving."
-        )
-
-    if teammate_name == "Anna" and last_speaker == "Emily":
-        return safe_pick(
-            [
-                "That makes sense to me.",
-                "Yeah, I think Emily’s logic helps there.",
-            ],
-            "That sounds reasonable to me."
-        )
-
-    if teammate_name == "Carlos" and last_speaker == "David" and phase != "early" and random.random() < 0.35:
-        return safe_pick(
-            [
-                "David’s not wrong, he’s just delivering it like a moon tax audit 😄",
-                "Okay, yes, fair — we should keep moving.",
-            ],
-            "Fair enough, we should move on."
-        )
-
-    # ----------------------------
-    # rank proposals
-    # ----------------------------
-    if first_item and (question_type == "rank_check" or guessed_rank or rank_range):
-        rank_text = f"#{rank_range[0]} or #{rank_range[1]}" if rank_range else f"#{guessed_rank}"
-
-        if first_item == "Portable heating unit" and guessed_rank == 15:
-            custom = {
-                "Anna": "Yeah, bottom-tier is fine. I’d move on.",
-                "Bas": "Okay, 15 is already the bottom anyway.",
-                "Carlos": "At that point the heating unit has been thoroughly humbled 😄",
-                "David": "Good enough. Next.",
-                "Emily": "That is acceptable as a bottom-tier placement.",
-            }
-            return custom.get(teammate_name, "Bottom-tier is fine.")
-
-        if first_item == "One case of dehydrated milk" and guessed_rank and guessed_rank <= 5:
-            custom = {
-                "Anna": "I think dehydrated milk is too high there.",
-                "Bas": "Maybe a little high for milk, honestly.",
-                "Carlos": "Milk that high feels optimistic 😄",
-                "David": "Too high. Move on.",
-                "Emily": "Dehydrated milk should not be above the strongest navigation and communication items.",
-            }
-            return custom.get(teammate_name, "That seems too high for dehydrated milk.")
-
-        rank_pools = {
-            "Anna": {
-                "very_close": [maybe_disagree(
-                    f"Yeah, I think {short_item_name(first_item)} around {rank_text} makes sense.",
-                    f"I could imagine {short_item_name(first_item)} slightly above or below {rank_text}, but it is in the general area."
-                )],
-                "reasonable": [f"That seems fairly reasonable for {short_item_name(first_item)}."],
-                "far": [f"I’m not fully convinced about {short_item_name(first_item)} around {rank_text}."],
-                None: [f"Maybe, but I’d compare {short_item_name(first_item)} with the stronger items first."],
-            },
-            "Bas": {
-                "very_close": [f"Sure, I can go with {short_item_name(first_item)} around {rank_text}."],
-                "reasonable": [f"Maybe. That sounds more sensible than some of my ideas."],
-                "far": [maybe_disagree(
-                    f"I don’t know… I’d probably still rank it differently.",
-                    f"That might work, but I’d still be tempted to place it differently."
-                )],
-                None: [f"Could be. I’m improvising too, honestly."],
-            },
-            "Carlos": {
-                "very_close": [f"Honestly, {short_item_name(first_item)} around {rank_text} is kind of solid."],
-                "reasonable": [f"That’s not a terrible call for {short_item_name(first_item)}."],
-                "far": [f"That feels a bit off for {short_item_name(first_item)}, not gonna lie."],
-                None: [f"Could work, depending on what we compare it to."],
-            },
-            "David": {
-                "very_close": [f"Fine. Keep {short_item_name(first_item)} around there and move on."],
-                "reasonable": [f"Close enough. Don’t spend forever on one item."],
-                "far": [f"No, that feels off for {short_item_name(first_item)}."],
-                None: [f"Pick a spot and keep going."],
-            },
-            "Emily": {
-                "very_close": [maybe_disagree(
-                    f"Yes, that placement for {short_item_name(first_item)} is defensible.",
-                    f"That placement for {short_item_name(first_item)} is defensible, though I would not treat it as the only possible answer."
-                )],
-                "reasonable": [f"That is in the right general range for {short_item_name(first_item)}, though not exact."],
-                "far": [f"I don’t think that range is correct for {short_item_name(first_item)}."],
-                None: [f"I’d want a clearer reason for placing {short_item_name(first_item)} there."],
-            },
-        }
-
-        return safe_pick(
-            rank_pools[teammate_name].get(rank_eval, rank_pools[teammate_name][None]),
-            "That could work, but I’d compare it carefully."
-        )
-
-    # ----------------------------
-    # disagreement / uncertainty / mild realism
-    # ----------------------------
-    if question_type == "comparison" and len(proposed_items) >= 2:
-        a, b = proposed_items[0], proposed_items[1]
-        a_short = short_item_name(a)
-        b_short = short_item_name(b)
-
-        pools = {
-            "Anna": [f"I’d compare {a_short} and {b_short} by asking which one helps us more directly."],
-            "Bas": [f"I’d probably go with whichever of {a_short} or {b_short} feels more immediately useful."],
-            "Carlos": [f"This {a_short} versus {b_short} debate is getting serious 😄"],
-            "David": [f"Compare {a_short} and {b_short}, pick the stronger one, and move on."],
-            "Emily": [f"Compare {a_short} and {b_short} by direct survival value, not by intuition."],
-        }
-        return safe_pick(pools[teammate_name], "We should compare which one helps survival more directly.")
+        return safe_pick(direct_pools[teammate_name], "I’d compare the next strongest items directly.")
 
     if question_type == "why" and first_item:
-        short_name = short_item_name(first_item)
+        return reasoned_item_take(first_item)
 
-        pools = {
-            "Anna": [
-                f"I think it depends on whether {short_name} directly helps survival.",
-                f"For me it comes down to whether {short_name} solves a real survival problem quickly."
-            ],
-            "Bas": [
-                f"I think it depends on whether {short_name} is actually useful here or just sounds useful.",
-                "Yeah, this task keeps punishing normal intuition."
-            ],
-            "Carlos": [
-                f"Because the moon loves making normal logic look stupid 😄",
-                f"{short_name.capitalize()} might sound useful on Earth, but the moon is being difficult about it."
-            ],
-            "David": [
-                f"Because either {short_name} helps directly, or it doesn’t.",
-                "Because some items matter immediately and others don’t."
-            ],
-            "Emily": [
-                f"It depends on whether {short_name} directly supports survival, navigation, or rescue.",
-                f"I’d judge {short_name} by function, not by how intuitively useful it sounds."
-            ],
-        }
-        return safe_pick(pools[teammate_name], "It depends on how directly it helps survival.")
+    if question_type == "comparison" and len(proposed_items) >= 2:
+        pair = {proposed_items[0], proposed_items[1]}
+        if pair == {"Two 100-lb tanks of oxygen", "5 gallons of water"}:
+            pools = {
+                "Anna": ["I’d still put oxygen first and water second."],
+                "Bas": ["I can see both, but oxygen first does make the most sense."],
+                "Carlos": ["Both are elite, but oxygen probably wins the moon final 😄"],
+                "David": ["Oxygen first. Water second. Move on."],
+                "Emily": ["Oxygen should outrank water, even though both are top-tier."],
+            }
+            return safe_pick(pools[teammate_name], "Oxygen first, water second.")
+
+        return reasoned_comparison_take(proposed_items[0], proposed_items[1])
+
+    if first_item and (asking_direct_item or guessed_rank is not None or rank_range is not None or explicit_slot is not None):
+        return answer_about_item(first_item, direct=asking_direct_item)
 
     if question_type == "agreement":
         pools = {
@@ -2114,10 +2310,22 @@ def teammate_reply_persona(
         }
         return safe_pick(pools[teammate_name], "Okay, then what would you put instead?")
 
-    # ----------------------------
-    # continuity
-    # ----------------------------
-    if remembered_slots and step % 5 == 0:
+    if confidence_style == "hedging" and first_item:
+        pools = {
+            "Anna": [f"That seems reasonable to test with {short_item_name(first_item)}."],
+            "Bas": ["Yeah, that could work honestly."],
+            "Carlos": ["That’s not a bad instinct at all 😄"],
+            "David": ["Good enough. Pick it and keep moving."],
+            "Emily": [f"That is at least a plausible direction for {short_item_name(first_item)}."],
+        }
+        return safe_pick(pools[teammate_name], "That seems worth considering.")
+
+    if phase != "early" and random.random() < {"Anna": 0.22, "Bas": 0.16, "Carlos": 0.18, "David": 0.12, "Emily": 0.24}[teammate_name]:
+        return initiative_prompt()
+
+    visible_consensus = has_visible_consensus(min_slots=2)
+
+    if visible_consensus and remembered_slots and step % 4 == 0:
         memory_pools = {
             "Anna": [f"So far, {remembered_slots} sounds reasonable to me."],
             "Bas": [f"We already seem to have {remembered_slots}, right?"],
@@ -2127,61 +2335,30 @@ def teammate_reply_persona(
         }
         return safe_pick(memory_pools[teammate_name], "That seems to be where we’re landing so far.")
 
-    # ----------------------------
-    # defaults
-    # ----------------------------
-    if teammate_name == "Bas" and step % 6 == 1 and phase != "early":
-        bas_wrongness = [
-            "Food still feels pretty important to me because being weak or hungry would make everything harder.",
-            "The heating unit still feels important because space is cold.",
-            "Pistols still sound more useful than people think.",
-            "I still don’t fully trust the idea that matches are completely useless.",
-            "I kind of want first aid a bit higher than people are putting it.",
-            "Nylon rope still feels like it could deserve more credit.",
-            "I’m not fully convinced the transmitter should automatically beat everything else after air and water.",
-            "I could see rope or first aid being stronger than people assume.",
-        ]
-        return safe_pick(
-            bas_wrongness,
-            "I still think one of the practical-sounding items might deserve more credit."
-        )
-
-    if teammate_name == "David" and random.random() < 0.10 and phase == "late":
-        return safe_pick(
-            [
-                "Can we just finalize the top five soon?",
-                "I think we have enough to start locking things in.",
-            ],
-            "Let’s start wrapping this into a ranking."
-        )
-
     if top_already_done:
         progressed_pools = {
             "Anna": [
                 "I think we should focus on the lower remaining items now.",
-                "The top already looks fairly settled, so I’d work on the remaining middle and lower slots."
+                "The top already looks fairly settled, so I’d work on the remaining middle and lower slots.",
             ],
             "Bas": [
                 "Yeah, the top seems mostly done already, so maybe we sort out the remaining awkward ones.",
-                "I think we’re past the obvious top items now."
+                "I think we’re past the obvious top items now.",
             ],
             "Carlos": [
                 "I think we’ve already done the moon VIPs 😄 now we need the awkward leftovers.",
-                "Top of the list feels mostly settled, so now we deal with the messier middle and bottom bits."
+                "Top of the list feels mostly settled, so now we deal with the messier middle and bottom bits.",
             ],
             "David": [
                 "Top looks done enough. Move to the remaining slots.",
-                "We already handled the obvious top items. Keep going."
+                "We already handled the obvious top items. Keep going.",
             ],
             "Emily": [
                 "The strongest items already seem mostly placed, so the useful step now is refining the remaining slots.",
-                "We appear to have the top tier mostly established, so I’d work through the unresolved lower positions."
+                "We appear to have the top tier mostly established, so I’d work through the unresolved lower positions.",
             ],
         }
-        return safe_pick(
-            progressed_pools[teammate_name],
-            "The top seems mostly settled, so let’s work on the remaining slots."
-        )
+        return safe_pick(progressed_pools[teammate_name], "The top seems mostly settled, so let’s work on the remaining slots.")
 
     if phase == "early":
         early_grounded = {
@@ -2189,43 +2366,38 @@ def teammate_reply_persona(
                 "I’d start with oxygen and water first.",
                 "The obvious survival items should come first.",
                 "I’d lock in air and water before we worry about the middle items.",
-                "To me, oxygen and water should be settled before anything else.",
             ],
             "Bas": [
                 "I’d still begin with the basics like air and water.",
                 "We probably need the obvious essentials first.",
                 "I’d start with the things that keep you alive right away, like air and water.",
-                "At the start, I’d keep it simple and go with the core survival items.",
             ],
             "Carlos": [
                 "I’d start simple: oxygen and water first.",
                 "First pass? Air and water near the top.",
-                "Before we get fancy, oxygen and water should probably be settled.",
                 "My boring serious answer is still air and water first 😄",
             ],
             "David": [
                 "Start with oxygen and water. Then move on.",
                 "Top first: oxygen and water.",
                 "Settle oxygen and water first. Don’t waste time.",
-                "Air and water first. Then do the next strong item.",
             ],
             "Emily": [
                 "Start with oxygen and water, then navigation and communication.",
                 "The strongest starting point is oxygen, water, then the map/transmitter tier.",
                 "I’d begin with oxygen and water, then move to the stellar map and transmitter.",
-                "The first pass should prioritize immediate survival, then navigation and communication.",
             ],
         }
         return safe_pick(early_grounded[teammate_name], "Start with oxygen and water first.")
-    
+
     neutral_pools = {
         "Anna": [
             "If you’re stuck, oxygen and water are obvious top priorities.",
             "Try making a first draft top five and we’ll adjust.",
         ],
         "Bas": [
-            "I’d still start with something intuitive, like food or heating.",
-            "Food first because hungry people think badly.",
+            "I could see rope or first aid being stronger than people assume.",
+            "I’d still start with something practical in the middle after the top items.",
         ],
         "Carlos": [
             "Serious answer: oxygen and water should be near the top.",
@@ -2241,6 +2413,7 @@ def teammate_reply_persona(
         ],
     }
     return safe_pick(neutral_pools[teammate_name], "Let’s start with oxygen and water.")
+
 
 def ui_rank_change_reaction(role_name, leadership_style, change):
     """
@@ -2674,7 +2847,162 @@ def leader_reply_to_teammate(leadership_style, teammate_name, teammate_text):
         context="general"
     )
 
-def choose_speaking_flow(leadership_style, meta_intent, explicit_slot, asking_direct_item, wrong_or_weak):
+def is_david_hurry_message(text: str):
+    if not text:
+        return False
+
+    t = normalize_text(text)
+
+    hurry_cues = [
+        "move on",
+        "keep moving",
+        "keep it moving",
+        "keep going",
+        "keep the pace up",
+        "dont waste time",
+        "don't waste time",
+        "dont spend forever",
+        "don't spend forever",
+        "stay focused and finish",
+        "finish this",
+        "this is dragging",
+        "lock the strongest items",
+        "top looks done enough",
+        "then go to the next item",
+        "lock one item and move on",
+        "pick something",
+        "debating forever",
+        "any draft is better",
+        "speedrun this",
+        "just choose one",
+        "choose one",
+        "top first",
+        "answer it directly",
+        "pick the stronger item",
+        "that works for",
+    ]
+
+    if any(cue in t for cue in hurry_cues):
+        return True
+
+    if re.search(r"\bnext[.!?]?$", t):
+        return True
+
+    if re.search(r"\btop first\b", t):
+        return True
+
+    return False
+
+
+def count_david_hurry_messages(extra_text=None):
+    count = 0
+
+    for msg in st.session_state.get("chat", []):
+        if msg.get("role") == "David" and is_david_hurry_message(msg.get("text", "")):
+            count += 1
+
+    if extra_text and is_david_hurry_message(extra_text):
+        count += 1
+
+    return count
+
+
+def infer_conflict_topic(user_text: str = "", david_text: str = "", reply_to_text: str = ""):
+    for candidate in [david_text, reply_to_text, user_text]:
+        mentioned = extract_items_from_text(candidate or "")
+        if mentioned:
+            return mentioned[0]
+
+    return get_last_item_discussed()
+
+
+def should_trigger_team_micro_conflict(
+    david_text: str,
+    current_hurry_count: int,
+    user_text: str = "",
+    reply_to_text: str = "",
+):
+    if st.session_state.get("team_micro_conflict_used", False):
+        return False
+
+    if not is_david_hurry_message(david_text):
+        return False
+
+    turns = st.session_state.get("turns", 0)
+    if turns < 2 or turns > 8:
+        return False
+
+    if current_hurry_count < 2:
+        return False
+
+    # Do not trigger it extremely late when most of the ranking is already filled.
+    if len(get_filled_slots_from_ui()) >= 9:
+        return False
+
+    topic_item = infer_conflict_topic(
+        user_text=user_text,
+        david_text=david_text,
+        reply_to_text=reply_to_text,
+    )
+    return topic_item is not None
+
+
+def build_team_micro_conflict(
+    leadership_style,
+    david_text: str,
+    user_text: str = "",
+    reply_to_text: str = "",
+):
+    critic = random.choice(["Bas", "Carlos"])
+
+    topic_item = infer_conflict_topic(
+        user_text=user_text,
+        david_text=david_text,
+        reply_to_text=reply_to_text,
+    )
+    if not topic_item:
+        return []
+
+    topic = short_item_name(topic_item)
+
+    critic_pools = {
+        "Bas": [
+            f"I get wanting to move fast, David, but if we rush {topic} we might stop explaining why it belongs there.",
+            f"Sure, pace matters, David, but if we speed through {topic} we’ll rank on instinct instead of logic.",
+            f"I’m okay with moving faster, David, just not so fast that we skip the reasoning on {topic}.",
+        ],
+        "Carlos": [
+            f"Easy, David 😄 Speed helps, but if we bulldoze {topic} we’ll end up doing Earth logic in space.",
+            f"I get the rush, David, but moon logic is already weird enough without us sprinting past the reasoning on {topic} 😄",
+            f"Fast is good, David, but not if {topic} turns into a chaos speedrun instead of an actual comparison 😄",
+        ],
+    }
+
+    leader_pools = {
+        "servant": [
+            f"I hear both sides. David is right that we should not spend too long on {topic}, and {critic} is right that we still need enough reasoning to place {topic} well. Give one short reason on {topic}, then we’ll decide and move on together.",
+            f"Both points matter here. We do want to keep moving, but I also do not want anyone rushed past the reasoning on {topic}. Give one brief explanation on {topic}, then we’ll choose and continue.",
+        ],
+        "task_focused": [
+            f"Both concerns are fair. We should not spend too long on {topic}, but we still need enough logic to place it well. One brief justification on {topic}, one decision, then continue.",
+            f"Let’s keep this efficient without becoming sloppy. David is right about pace, and {critic} is right that {topic} still needs a reasoned placement. Keep it brief, decide, then move on.",
+        ],
+        "authoritarian": [
+            f"Enough. We are not spending all day on {topic}. One short reason on {topic}, one decision, then we move on.",
+            f"That is enough. David is right that we should keep the pace up. Give one short reason for {topic}, make the choice, and continue.",
+        ],
+    }
+
+    critic_text = random.choice(critic_pools[critic])
+    leader_text = random.choice(leader_pools[leadership_style])
+
+    return [
+        (critic, critic_text, "David", david_text),
+        ("Leader", leader_text, critic, critic_text),
+    ]
+
+
+def choose_speaking_flow(leadership_style, meta_intent, explicit_slot, asking_direct_item, wrong_or_weak, question_type=None):
     """
     Decide who should go first after the participant.
     Returns one of:
@@ -2685,7 +3013,12 @@ def choose_speaking_flow(leadership_style, meta_intent, explicit_slot, asking_di
     """
     last_flow = st.session_state.get("last_speaking_flow")
 
-    if meta_intent in ["confused", "next_step", "boundary_check"]:
+    if meta_intent in ["confused", "next_step", "boundary_check", "scenario_question"]:
+        flow = "leader_first"
+        st.session_state.last_speaking_flow = flow
+        return flow
+
+    if leadership_style == "authoritarian" and question_type == "why":
         flow = "leader_first"
         st.session_state.last_speaking_flow = flow
         return flow
@@ -2709,6 +3042,7 @@ def choose_speaking_flow(leadership_style, meta_intent, explicit_slot, asking_di
                 "leader_then_teammate_reaction",
                 "leader_first",
             ]
+
     elif explicit_slot is not None or asking_direct_item:
         if leadership_style == "authoritarian":
             options = [
