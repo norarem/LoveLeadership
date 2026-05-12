@@ -215,7 +215,10 @@ st.title("Thank you for participating 🚀")
 
 st.write(
     "Your responses have been recorded successfully. You have completed the experiment. "
-    "Thank you for your participation. Below, you can compare your ranking with NASA’s expert solution."
+    "Thank you for your participation. " 
+    "For users of Survey Circle, redeem Survey Code with one click: https://www.surveycircle.com/L6G7-JC6X-G7XX-SKJE/"
+    
+    "Below, you can compare your ranking with NASA’s expert solution."
 )
 
 
