@@ -213,13 +213,20 @@ score = st.session_state.data.get("nasa_score")
 st.title("Thank you for participating 🚀")
 
 
-st.write(
-    "Your responses have been recorded successfully. You have completed the experiment. "
-    "Thank you for your participation. " 
-    "For users of Survey Circle, redeem Survey Code with one click: https://www.surveycircle.com/L6G7-JC6X-G7XX-SKJE/"
-    
-    "Below, you can compare your ranking with NASA’s expert solution."
-)
+st.markdown("""
+Your responses have been recorded successfully. You have completed the experiment.
+
+Thank you for your participation.
+
+For users of Survey Circle, redeem your Survey Code with one click:
+[https://www.surveycircle.com/L6G7-JC6X-G7XX-SKJE/](https://www.surveycircle.com/L6G7-JC6X-G7XX-SKJE/)
+The following code gives you Karma that can be used to get free research participants at SurveySwap.io.
+Go to:
+[https://surveyswap.io/sr/6E35-PK7B-LRAO](https://surveyswap.io/sr/6E35-PK7B-LRAO)
+Or, alternatively, enter the code manually: `6E35-PK7B-LRAO`
+
+**Below, you can compare your ranking with NASA's expert solution.**
+""")
 
 
 st.subheader("🧠 Your performance")

@@ -313,6 +313,8 @@ Please select the “I consent to participate in this study” box below if you:
 
 - Are above 18 years old 
 - Have read the information above and agree to this 
+             
+PS: this survey contains a completion code for SurveySwap.io and SurveyCircle
 
     """)
 
